@@ -86,10 +86,10 @@ def unpack_directory_archive(payload: bytes, destination: pathlib.Path) -> None:
 def ensure_daemon(args: argparse.Namespace) -> None:
     jupyter_client.ensure_daemon(
         args.daemon_url,
-        auto_start=args.start_daemon,
+        auto_start=False,
         stream_url=args.stream_url,
-        headless=args.headless,
-        log_path=args.daemon_log,
+        headless=True,
+        log_path=jupyter_client.DEFAULT_LOG,
         timeout=args.daemon_start_timeout,
     )
 
@@ -170,11 +170,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("destination", help="local path, jupyter:/absolute/path, or jupyter:relative/path")
     parser.add_argument("--daemon-url", default=os.environ.get("JUPYTERD_API_URL", jupyter_client.DEFAULT_API_URL))
     parser.add_argument("--stream-url", default=os.environ.get("JUPYTERD_STREAM_URL", jupyter_client.DEFAULT_STREAM_URL))
-    parser.add_argument("--start-daemon", action="store_true", help="start jupyterd in the background if needed")
-    parser.set_defaults(headless=True)
-    parser.add_argument("--headless", action="store_true", help="when starting jupyterd, launch Chrome headless (default)")
-    parser.add_argument("--visible", dest="headless", action="store_false", help="when starting jupyterd, launch visible Chrome")
-    parser.add_argument("--daemon-log", default=os.environ.get("JUPYTERD_LOG", jupyter_client.DEFAULT_LOG))
     parser.add_argument("--daemon-start-timeout", type=float, default=20.0)
     parser.add_argument("--timeout", type=float, default=float(os.environ.get("JUPYTER_SH_TIMEOUT", "180")))
     parser.add_argument("--chunk-size", type=int, default=262144, help="upload websocket chunk size in characters")

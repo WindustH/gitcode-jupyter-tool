@@ -32,9 +32,17 @@ JUPYTER_SH = importlib.machinery.SourceFileLoader(
     "jupyter_runtime",
     str(THIS_DIR / "jupyter_runtime.py"),
 ).load_module()
+JUPYTER_DIRECT = importlib.machinery.SourceFileLoader(
+    "jupyter_direct",
+    str(THIS_DIR / "jupyter_direct.py"),
+).load_module()
 
 DEFAULT_HUB_URL = "https://gitcode.com/cann/cann-learning-hub"
+DEFAULT_REPO_URL = "https://gitcode.com/cann/cann-learning-hub.git"
+DEFAULT_NOTEBOOK_PATH = "quick_start/cann_basics"
+DEFAULT_SCAN_FILE_PATH = "quick_start/cann_basics/01_ai_basics.ipynb"
 DEFAULT_CHROME_PROFILE = "~/.config/jupyter-tool/chrome-profile"
+DEFAULT_AUTH_CACHE = "~/.config/jupyter-tool/auth.json"
 DEFAULT_STATE_FILE = "/tmp/jupyterd-state.json"
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 18787
@@ -43,6 +51,15 @@ DEFAULT_STREAM_PORT = 18788
 DOWNLOAD_BEGIN_MARK = "__JUPYTERD_DOWNLOAD_BEGIN__"
 DOWNLOAD_END_MARK = "__JUPYTERD_DOWNLOAD_END__"
 INTERACTIVE_PS1 = r"\[\033[1;36m\]\w\[\033[0m\] \[\033[1;32m\]\$\[\033[0m\] "
+
+
+def default_chrome_bin() -> str:
+    if os.environ.get("CHROME"):
+        return os.environ["CHROME"]
+    bundled = pathlib.Path("/opt/google/chrome/google-chrome")
+    if bundled.exists():
+        return str(bundled)
+    return "google-chrome-stable"
 
 
 class JupyterdError(RuntimeError):
@@ -185,6 +202,171 @@ def ensure_cdp(args: argparse.Namespace, *, headless: bool | None = None) -> Non
         "close it and start it with --remote-debugging-port, or run jupyterd after launching "
         f"Chrome manually. Last error: {last_error}"
     )
+
+
+def auth_cache_path(args: argparse.Namespace) -> pathlib.Path:
+    return pathlib.Path(args.auth_cache).expanduser()
+
+
+def load_cached_auth(args: argparse.Namespace) -> Any | None:
+    path = auth_cache_path(args)
+    if not path.exists():
+        return None
+    try:
+        auth = JUPYTER_DIRECT.CookieAuth.from_cache(path)
+    except Exception as exc:
+        log(f"ignored unreadable auth cache: {exc}")
+        return None
+    if not auth.valid(margin=args.auth_refresh_margin):
+        return None
+    return auth
+
+
+def extract_auth_from_chrome(args: argparse.Namespace, *, headless: bool | None = None) -> Any:
+    ensure_cdp(args, headless=headless)
+    try:
+        auth = JUPYTER_DIRECT.extract_cookies_from_cdp(args.cdp_list_url, debug=args.debug)
+    except Exception:
+        open_new_tab(args.cdp_list_url, args.hub_url)
+        time.sleep(args.hub_load_delay)
+        auth = JUPYTER_DIRECT.extract_cookies_from_cdp(args.cdp_list_url, debug=args.debug)
+    auth.save(auth_cache_path(args))
+    summary = auth.redacted_summary()
+    log(f"cached GitCode auth from Chrome profile: {len(summary.get('names', []))} cookie names")
+    return auth
+
+
+def get_direct_auth(
+    args: argparse.Namespace,
+    *,
+    force_extract: bool = False,
+    allow_chrome: bool = True,
+    headless: bool | None = None,
+) -> Any:
+    if not force_extract:
+        cached = load_cached_auth(args)
+        if cached is not None:
+            return cached
+    if not allow_chrome:
+        raise JupyterdError("GitCode auth cache is missing or expired")
+    return extract_auth_from_chrome(args, headless=headless)
+
+
+def direct_probe_output(status: dict[str, Any], notebook: Any) -> str:
+    pieces = [f"notebook_id={notebook.notebook_id}"]
+    for key in ("connections", "kernels", "started", "last_activity"):
+        if key in status:
+            pieces.append(f"{key}={status[key]}")
+    return "\n".join(pieces)
+
+
+def previous_notebook_from_state(args: argparse.Namespace) -> Any | None:
+    if not args.state_file:
+        return None
+    path = pathlib.Path(args.state_file).expanduser()
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        href = str(data.get("href") or "")
+        if "aihub-run.gitcode.com" not in href:
+            return None
+        return JUPYTER_DIRECT.notebook_from_lab_url(
+            href,
+            target_url=str(data.get("target_url") or ""),
+            raw={
+                "state_file": str(path),
+                "state_time": data.get("time"),
+                "status": data.get("status") if isinstance(data.get("status"), dict) else {},
+                "notebook_id": data.get("notebook_id"),
+            },
+        )
+    except Exception as exc:
+        log(f"ignored unusable notebook state: {exc}")
+        return None
+
+
+def direct_probe_context(client: Any, notebook: Any, args: argparse.Namespace) -> SimpleNamespace:
+    status = JUPYTER_DIRECT.probe_notebook(client, notebook, timeout=args.probe_timeout)
+    previous_started = str((notebook.raw.get("status") or {}).get("started") or "")
+    current_started = str(status.get("started") or "")
+    if previous_started and current_started and previous_started != current_started:
+        log(
+            "notebook backend restarted; remote temporary files may have been reset: "
+            f"{notebook.base_url} previous_started={previous_started} current_started={current_started}"
+        )
+    probe = {
+        "ok": True,
+        "href": notebook.lab_url,
+        "target_url": notebook.target_url,
+        "notebook_id": notebook.notebook_id,
+        "base_url": notebook.base_url,
+        "status": status,
+        "output": direct_probe_output(status, notebook),
+    }
+    return SimpleNamespace(client=client, notebook=notebook, status=status, probe=probe)
+
+
+def direct_context(
+    args: argparse.Namespace,
+    *,
+    timeout: float,
+    force_auth_extract: bool = False,
+    allow_chrome: bool = True,
+    headless: bool | None = None,
+    skip_previous: bool = False,
+) -> SimpleNamespace:
+    deadline = time.monotonic() + timeout
+    last_error: Exception | None = None
+    force_extract_next = force_auth_extract
+    previous_dead = skip_previous
+    while True:
+        try:
+            auth = get_direct_auth(
+                args,
+                force_extract=force_extract_next,
+                allow_chrome=allow_chrome,
+                headless=headless,
+            )
+            client = JUPYTER_DIRECT.HttpClient(auth, cache_path=auth_cache_path(args))
+            previous = previous_notebook_from_state(args)
+            if previous is not None and not previous_dead:
+                try:
+                    context = direct_probe_context(client, previous, args)
+                    context.auth = auth
+                    log(f"reusing previous notebook: {previous.base_url}")
+                    return context
+                except JUPYTER_DIRECT.AuthError as exc:
+                    last_error = exc
+                    if allow_chrome and not force_extract_next:
+                        raise
+                    previous_dead = True
+                    log(f"previous notebook is not reusable after auth check: {exc}")
+                except Exception as exc:
+                    last_error = exc
+                    previous_dead = True
+                    log(f"previous notebook is not reusable: {exc}")
+
+            notebook = JUPYTER_DIRECT.insert_notebook(client, args)
+            if notebook.provisioning_status and notebook.provisioning_status != "READY":
+                raise JupyterdError(
+                    "notebook is not ready: "
+                    f"status={notebook.provisioning_status} queue={notebook.raw.get('queue_ahead_count')}"
+                )
+            context = direct_probe_context(client, notebook, args)
+            context.auth = auth
+            return context
+        except JUPYTER_DIRECT.AuthError as exc:
+            last_error = exc
+            if allow_chrome and not force_extract_next:
+                force_extract_next = True
+                continue
+        except Exception as exc:
+            last_error = exc
+
+        if time.monotonic() >= deadline:
+            raise JupyterdError(f"direct notebook probe failed: {last_error}") from last_error
+        time.sleep(args.create_probe_interval)
 
 
 def sh_args(args: argparse.Namespace, *, target: str, page: str) -> SimpleNamespace:
@@ -405,12 +587,18 @@ def write_state(args: argparse.Namespace, data: dict[str, Any]) -> None:
 
 
 def record_ok_state(args: argparse.Namespace, probe: dict[str, Any]) -> None:
+    status = probe.get("status") if isinstance(probe.get("status"), dict) else {}
     write_state(
         args,
         {
             "ok": True,
             "href": probe["href"],
             "target_url": probe.get("target_url") or probe["href"],
+            "notebook_id": probe.get("notebook_id"),
+            "base_url": probe.get("base_url"),
+            "status": status,
+            "remote_started": status.get("started"),
+            "remote_last_activity": status.get("last_activity"),
             "target_url_contains": args.notebook_target_contains,
             "page_url_contains": args.notebook_page_contains,
             "profile": str(pathlib.Path(args.chrome_user_data_dir).expanduser()),
@@ -449,17 +637,17 @@ def open_login_window_and_wait(args: argparse.Namespace, reason: Exception | str
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            probe = probe_notebook(args)
-            if probe["ok"]:
-                log(f"notebook ok after login: {probe['href']} | {probe['output'].replace(chr(10), ' ; ')}")
-                record_ok_state(args, probe)
-                return True
-        except Exception as exc:
-            last_error = exc
-
-        try:
-            click_online_experience(args)
-            return wait_for_notebook_after_click(args, args.create_timeout)
+            context = direct_context(
+                args,
+                timeout=max(1.0, args.login_probe_interval),
+                force_auth_extract=True,
+                allow_chrome=True,
+                headless=False,
+            )
+            probe = context.probe
+            log(f"notebook ok after login: {probe['href']} | {probe['output'].replace(chr(10), ' ; ')}")
+            record_ok_state(args, probe)
+            return True
         except Exception as exc:
             last_error = exc
 
@@ -469,14 +657,18 @@ def open_login_window_and_wait(args: argparse.Namespace, reason: Exception | str
 
 
 def maintain_once(args: argparse.Namespace) -> bool:
-    ensure_cdp(args)
     try:
-        probe = probe_notebook(args)
-        if probe["ok"]:
-            log(f"notebook ok: {probe['href']} | {probe['output'].replace(chr(10), ' ; ')}")
-            record_ok_state(args, probe)
-            return True
-        log(f"notebook probe failed: status={probe['status']} output={probe['output']}")
+        context = direct_context(
+            args,
+            timeout=args.direct_timeout,
+            force_auth_extract=False,
+            allow_chrome=not args.no_launch,
+            headless=args.headless,
+        )
+        probe = context.probe
+        log(f"notebook ok: {probe['href']} | {probe['output'].replace(chr(10), ' ; ')}")
+        record_ok_state(args, probe)
+        return True
     except Exception as exc:
         log(f"notebook not ready: {exc}")
 
@@ -484,14 +676,10 @@ def maintain_once(args: argparse.Namespace) -> bool:
         write_state(args, {"ok": False, "reason": "status_only", "time": time.time()})
         return False
 
-    try:
-        click_online_experience(args)
-        return wait_for_notebook_after_click(args, args.create_timeout)
-    except Exception as exc:
-        write_state(args, {"ok": False, "reason": str(exc), "time": time.time()})
-        if not args.no_login_window:
-            return open_login_window_and_wait(args, exc)
-        raise
+    write_state(args, {"ok": False, "reason": "direct_probe_failed", "time": time.time()})
+    if not args.no_login_window and not args.no_launch:
+        return open_login_window_and_wait(args, "direct probe failed")
+    raise JupyterdError("direct notebook probe failed and browser launch is disabled")
 
 
 def terminal_rows_cols(rows: int | None, cols: int | None) -> tuple[int, int]:
@@ -519,6 +707,43 @@ def wait_command_marker(
                 collected = collected[-1024 * 1024 * 8 :]
         session.cdp.pump(0.1)
     return 124, collected if raw else JUPYTER_SH.strip_terminal_noise(collected)
+
+
+def wait_api_command_marker(
+    terminal: Any,
+    output: collections.deque[str],
+    marker: str,
+    timeout: float,
+    *,
+    raw: bool,
+) -> tuple[int, str]:
+    collected = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        while output:
+            collected += output.popleft()
+            match = re.search(re.escape(marker) + r"([0-9]+)", collected)
+            if match:
+                text = collected[: match.start()]
+                return int(match.group(1)), text if raw else JUPYTER_SH.strip_terminal_noise(text)
+            if len(collected) > 1024 * 1024 * 16:
+                collected = collected[-1024 * 1024 * 8 :]
+        chunk = terminal.read_once(0.1)
+        if chunk:
+            output.append(chunk)
+        if getattr(terminal, "closed", False):
+            while output:
+                collected += output.popleft()
+            raise JupyterdError("remote terminal closed before command completed")
+    return 124, collected if raw else JUPYTER_SH.strip_terminal_noise(collected)
+
+
+def drain_api_terminal(terminal: Any, output: collections.deque[str], seconds: float) -> None:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        chunk = terminal.read_once(max(0.01, min(0.1, deadline - time.monotonic())))
+        if chunk:
+            output.append(chunk)
 
 
 class AsyncJobManager:
@@ -608,12 +833,32 @@ class LiveTerminal:
         self.id = secrets.token_hex(12)
         self.output: collections.deque[str] = collections.deque()
         self.condition = threading.Condition()
-        self.cdp_lock = threading.RLock()
+        self.io_lock = threading.RLock()
         self.closed = False
-        self.session = service.connect_notebook()
-        self.terminal = JUPYTER_SH.BrowserTerminal(self.session, self._on_output, rows=rows, cols=cols)
-        with self.cdp_lock:
-            self.terminal.start()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            self.context = service.direct_context(skip_previous=attempt > 0)
+            self.href = self.context.notebook.lab_url
+            self.terminal = JUPYTER_DIRECT.ApiTerminal(
+                self.context.client,
+                self.context.notebook,
+                self._on_output,
+                rows=rows,
+                cols=cols,
+            )
+            try:
+                with self.io_lock:
+                    self.terminal.start()
+                break
+            except Exception as exc:
+                last_error = exc
+                self.terminal.close()
+                if attempt == 0:
+                    log(f"interactive terminal failed on current notebook; replacing notebook: {exc}")
+                    continue
+                raise
+        if last_error is not None and getattr(self, "terminal", None) is None:
+            raise last_error
         self.thread = threading.Thread(target=self._pump_loop, name=f"jupyterd-terminal-{self.id}", daemon=True)
         self.thread.start()
 
@@ -629,19 +874,21 @@ class LiveTerminal:
     def _pump_loop(self) -> None:
         while not self.closed:
             try:
-                with self.cdp_lock:
-                    self.session.cdp.pump(0.02)
+                with self.io_lock:
+                    text = self.terminal.read_once(0.02)
+                if text:
+                    self._on_output(text)
             except Exception as exc:
                 self._on_output(f"\n[jupyterd terminal pump failed: {exc}]\n")
                 self.closed = True
                 break
 
     def input(self, data: str) -> None:
-        with self.cdp_lock:
+        with self.io_lock:
             self.terminal.send(data)
 
     def resize(self, rows: int, cols: int) -> None:
-        with self.cdp_lock:
+        with self.io_lock:
             self.terminal.set_size(rows, cols)
 
     def read(self, timeout: float) -> str:
@@ -691,11 +938,8 @@ class LiveTerminal:
         self.closed = True
         with self.condition:
             self.condition.notify_all()
-        try:
-            with self.cdp_lock:
-                self.terminal.close()
-        finally:
-            self.session.cdp.close()
+        with self.io_lock:
+            self.terminal.close()
 
 
 class JupyterDaemonService:
@@ -721,8 +965,21 @@ class JupyterDaemonService:
         return {"ok": True, "job": self.jobs.get(job_id)}
 
     def ensure(self) -> bool:
+        self.direct_context()
+        return True
+
+    def direct_context(self, *, skip_previous: bool = False) -> Any:
         with self.ensure_lock:
-            return maintain_once(self.args)
+            context = direct_context(
+                self.args,
+                timeout=self.args.create_timeout,
+                force_auth_extract=False,
+                allow_chrome=not self.args.no_launch,
+                headless=self.args.headless,
+                skip_previous=skip_previous,
+            )
+            record_ok_state(self.args, context.probe)
+            return context
 
     def connect_notebook(self) -> Any:
         return JUPYTER_SH.connect_browser(
@@ -744,43 +1001,55 @@ class JupyterDaemonService:
         no_prelude: bool = False,
         ensure: bool = True,
     ) -> dict[str, Any]:
-        if ensure:
-            self.ensure()
-        try:
-            session = self.connect_notebook()
-        except Exception:
-            if not ensure:
-                raise
-            self.ensure()
-            session = self.connect_notebook()
-        output: collections.deque[str] = collections.deque()
-        marker = f"__JUPYTERD_RUN_{secrets.token_hex(8)}__:"
-        row_count, col_count = terminal_rows_cols(rows, cols)
-        terminal = JUPYTER_SH.BrowserTerminal(session, output.append, rows=row_count, cols=col_count)
-        try:
-            terminal.start()
-            session.cdp.pump_for(0.5)
-            output.clear()
-            if not no_prelude:
-                terminal.send("stty -echo 2>/dev/null || true\nexport PS1='' PS2=''\n")
-                session.cdp.pump_for(0.2)
-                output.clear()
-            wrapped = "\n".join(
-                [
-                    "(",
-                    command,
-                    ")",
-                    "__jupyterd_run_status=$?",
-                    f"printf '{marker}%s\\n' \"$__jupyterd_run_status\"",
-                    "",
-                ]
+        last_error: Exception | None = None
+        for attempt in range(2):
+            context = self.direct_context(skip_previous=attempt > 0) if ensure else direct_context(
+                self.args,
+                timeout=self.args.direct_timeout,
+                force_auth_extract=False,
+                allow_chrome=False,
+                skip_previous=attempt > 0,
             )
-            terminal.send(wrapped)
-            status, text = wait_command_marker(session, output, marker, timeout, raw=raw)
-            return {"ok": status == 0, "exit_code": status, "stdout": text, "href": session.href}
-        finally:
-            terminal.close()
-            session.cdp.close()
+            output: collections.deque[str] = collections.deque()
+            marker = f"__JUPYTERD_RUN_{secrets.token_hex(8)}__:"
+            row_count, col_count = terminal_rows_cols(rows, cols)
+            terminal = JUPYTER_DIRECT.ApiTerminal(
+                context.client,
+                context.notebook,
+                output.append,
+                rows=row_count,
+                cols=col_count,
+            )
+            try:
+                terminal.start()
+                drain_api_terminal(terminal, output, 0.5)
+                output.clear()
+                if not no_prelude:
+                    terminal.send("stty -echo 2>/dev/null || true\nexport PS1='' PS2=''\n")
+                    drain_api_terminal(terminal, output, 0.2)
+                    output.clear()
+                wrapped = "\n".join(
+                    [
+                        "(",
+                        command,
+                        ")",
+                        "__jupyterd_run_status=$?",
+                        f"printf '{marker}%s\\n' \"$__jupyterd_run_status\"",
+                        "",
+                    ]
+                )
+                terminal.send(wrapped)
+                status, text = wait_api_command_marker(terminal, output, marker, timeout, raw=raw)
+                return {"ok": status == 0, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    log(f"remote command failed on current notebook; replacing notebook: {exc}")
+                    continue
+                raise
+            finally:
+                terminal.close()
+        raise JupyterdError(f"remote command failed after notebook replacement: {last_error}")
 
     def upload(
         self,
@@ -792,14 +1061,6 @@ class JupyterDaemonService:
         timeout: float,
         chunk_size: int,
     ) -> dict[str, Any]:
-        self.ensure()
-        try:
-            session = self.connect_notebook()
-        except Exception:
-            self.ensure()
-            session = self.connect_notebook()
-        output: collections.deque[str] = collections.deque()
-        terminal = JUPYTER_SH.BrowserTerminal(session, output.append, rows=24, cols=120)
         marker = f"__JUPYTERD_UPLOAD_{secrets.token_hex(8)}__:"
         heredoc = f"__JUPYTERD_UPLOAD_PAYLOAD_{secrets.token_hex(8)}__"
         destination_arg = shlex.quote(destination)
@@ -841,47 +1102,64 @@ __JUPYTERD_UPLOAD_PY__
             archive_flag,
             mode,
         )
-        try:
-            terminal.start()
-            session.cdp.pump_for(0.5)
-            output.clear()
-            terminal.send("stty -echo 2>/dev/null || true\nexport PS1='' PS2=''\n")
-            session.cdp.pump_for(0.2)
-            output.clear()
-            terminal.send(
-                "\n".join(
-                    [
-                        "set +e",
-                        "tmp_b64=$(mktemp /tmp/jupyterd-upload.XXXXXX.b64)",
-                        "cleanup_jupyterd_upload() { rm -f \"$tmp_b64\"; }",
-                        "trap cleanup_jupyterd_upload EXIT",
-                        f"cat > \"$tmp_b64\" <<'{heredoc}'",
-                        "",
-                    ]
-                )
+        last_error: Exception | None = None
+        for attempt in range(2):
+            context = self.direct_context(skip_previous=attempt > 0)
+            output: collections.deque[str] = collections.deque()
+            terminal = JUPYTER_DIRECT.ApiTerminal(
+                context.client,
+                context.notebook,
+                output.append,
+                rows=24,
+                cols=120,
             )
-            for index in range(0, len(payload_b64), chunk_size):
-                terminal.send(payload_b64[index : index + chunk_size])
-            if not payload_b64.endswith("\n"):
-                terminal.send("\n")
-            terminal.send(
-                "\n".join(
-                    [
-                        heredoc,
-                        remote_decode,
-                        "__jupyterd_upload_status=$?",
-                        f"printf '{marker}%s\\n' \"$__jupyterd_upload_status\"",
-                        "",
-                    ]
+            try:
+                terminal.start()
+                drain_api_terminal(terminal, output, 0.5)
+                output.clear()
+                terminal.send("stty -echo 2>/dev/null || true\nexport PS1='' PS2=''\n")
+                drain_api_terminal(terminal, output, 0.2)
+                output.clear()
+                terminal.send(
+                    "\n".join(
+                        [
+                            "set +e",
+                            "tmp_b64=$(mktemp /tmp/jupyterd-upload.XXXXXX.b64)",
+                            "cleanup_jupyterd_upload() { rm -f \"$tmp_b64\"; }",
+                            "trap cleanup_jupyterd_upload EXIT",
+                            f"cat > \"$tmp_b64\" <<'{heredoc}'",
+                            "",
+                        ]
+                    )
                 )
-            )
-            status, text = wait_command_marker(session, output, marker, timeout, raw=False)
-            if status != 0:
-                return {"ok": False, "exit_code": status, "stdout": text, "href": session.href}
-            return {"ok": True, "exit_code": 0, "stdout": text, "href": session.href}
-        finally:
-            terminal.close()
-            session.cdp.close()
+                for index in range(0, len(payload_b64), chunk_size):
+                    terminal.send(payload_b64[index : index + chunk_size])
+                if not payload_b64.endswith("\n"):
+                    terminal.send("\n")
+                terminal.send(
+                    "\n".join(
+                        [
+                            heredoc,
+                            remote_decode,
+                            "__jupyterd_upload_status=$?",
+                            f"printf '{marker}%s\\n' \"$__jupyterd_upload_status\"",
+                            "",
+                        ]
+                    )
+                )
+                status, text = wait_api_command_marker(terminal, output, marker, timeout, raw=False)
+                if status != 0:
+                    return {"ok": False, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}
+                return {"ok": True, "exit_code": 0, "stdout": text, "href": context.notebook.lab_url}
+            except Exception as exc:
+                last_error = exc
+                if attempt == 0:
+                    log(f"upload failed on current notebook; replacing notebook: {exc}")
+                    continue
+                raise
+            finally:
+                terminal.close()
+        raise JupyterdError(f"upload failed after notebook replacement: {last_error}")
 
     def download(self, *, source: str, recursive: bool, timeout: float) -> dict[str, Any]:
         source_arg = shlex.quote(source)
@@ -938,7 +1216,7 @@ __JUPYTERD_DOWNLOAD_PY__
         initial_output = terminal.prepare_interactive_prompt()
         with self.terminals_lock:
             self.terminals[terminal.id] = terminal
-        return {"ok": True, "id": terminal.id, "href": terminal.session.href, "initial_output": initial_output}
+        return {"ok": True, "id": terminal.id, "href": terminal.href, "initial_output": initial_output}
 
     def open_terminal(self, *, rows: int, cols: int) -> LiveTerminal:
         try:
@@ -1099,7 +1377,7 @@ class TerminalStreamHandler(socketserver.BaseRequestHandler):
             rows, cols = terminal_rows_cols(request.get("rows"), request.get("cols"))
             terminal = self.service.open_terminal(rows=rows, cols=cols)
             initial_output = terminal.prepare_interactive_prompt()
-            self._send_json_line({"ok": True, "id": terminal.id, "href": terminal.session.href})
+            self._send_json_line({"ok": True, "id": terminal.id, "href": terminal.href})
             if initial_output:
                 self.request.sendall(initial_output.encode("utf-8", "surrogateescape"))
             self.request.setblocking(False)
@@ -1181,9 +1459,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--hub-target-contains", default="gitcode.com/cann/cann-learning-hub")
     parser.add_argument("--hub-context-contains", default="gitcode.com/cann/cann-learning-hub")
     parser.add_argument("--experience-index", type=int, default=0, help="which 在线体验 entry to click")
+    parser.add_argument("--repo-url", default=os.environ.get("JUPYTERD_REPO_URL", DEFAULT_REPO_URL))
+    parser.add_argument("--ttl", default=os.environ.get("JUPYTERD_TTL", "120"))
+    parser.add_argument("--disk-size", default=os.environ.get("JUPYTERD_DISK_SIZE", "40Gi"))
+    parser.add_argument("--notebook-path", default=os.environ.get("JUPYTERD_NOTEBOOK_PATH", DEFAULT_NOTEBOOK_PATH))
+    parser.add_argument(
+        "--scan-file-path",
+        default=os.environ.get("JUPYTERD_SCAN_FILE_PATH", DEFAULT_SCAN_FILE_PATH),
+    )
+    parser.add_argument("--gitcode-user", default=os.environ.get("GITCODE_USER", "username"))
+    parser.add_argument(
+        "--auth-cache",
+        default=os.environ.get("JUPYTERD_AUTH_CACHE", DEFAULT_AUTH_CACHE),
+        help=f"local 0600 cookie/token cache (default: {DEFAULT_AUTH_CACHE})",
+    )
+    parser.add_argument(
+        "--auth-refresh-margin",
+        type=float,
+        default=float(os.environ.get("JUPYTERD_AUTH_REFRESH_MARGIN", "300")),
+        help="refresh cached auth this many seconds before expiry",
+    )
     parser.add_argument("--notebook-target-contains", default="notebookcann")
     parser.add_argument("--notebook-page-contains", default="/lab")
-    parser.add_argument("--chrome-bin", default=os.environ.get("CHROME", "google-chrome-stable"))
+    parser.add_argument("--chrome-bin", default=default_chrome_bin())
     parser.add_argument(
         "--chrome-user-data-dir",
         default=os.environ.get("JUPYTERD_CHROME_PROFILE_DIR", DEFAULT_CHROME_PROFILE),
@@ -1222,6 +1520,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--no-launch", action="store_true", help="do not start Chrome if DevTools is unavailable")
     parser.add_argument("--context-wait", type=float, default=8.0)
     parser.add_argument("--probe-timeout", type=float, default=20.0)
+    parser.add_argument("--insert-timeout", type=float, default=30.0)
+    parser.add_argument("--direct-timeout", type=float, default=30.0)
     parser.add_argument("--create-timeout", type=float, default=180.0)
     parser.add_argument("--create-probe-interval", type=float, default=5.0)
     parser.add_argument("--chrome-start-timeout", type=float, default=20.0)

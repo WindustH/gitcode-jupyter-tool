@@ -139,7 +139,7 @@ def ensure_daemon(
     if auto_start:
         start_daemon(api_url=api_url, stream_url=stream_url, headless=headless, log_path=log_path, timeout=timeout)
         return
-    raise JupyterClientError(f"jupyterd is not running at {api_url}; start it with dev/jupyter-tool/jupyterd")
+    raise JupyterClientError(f"jupyterd is not running at {api_url}; start it with jupyter-ctl start")
 
 
 def print_error(message: str) -> None:
