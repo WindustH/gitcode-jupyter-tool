@@ -1,153 +1,155 @@
-# jupyter-tool
+# gitcode-jupyter-tool
 
 [中文文档](README.zh-CN.md)
 
-`jupyter-tool` contains small local utilities for working with a GitCode CANN JupyterLab notebook.
+`gitcode-jupyter-tool` provides Rust command-line tools for using the GitCode CANN online JupyterLab experience as a remote shell, plus local/remote file copy.
 
-`jupyterd` is the daemon. It owns all Chrome DevTools and Jupyter terminal interaction, keeps a notebook available, and exposes a small local HTTP API.
+The project now builds four executables:
 
-It uses a dedicated Chrome profile at `~/.config/jupyter-tool/chrome-profile`. If that profile is already logged into GitCode, it reuses the login and can run headless. If it is not logged in, a visible Chrome window is opened so you can log in once; later runs reuse that dedicated profile.
+- `gjtd`: GitCode Jupyter Tool daemon. It keeps a usable notebook available and exposes a local HTTP API plus a low-latency TCP stream.
+- `jush`: Jupyter shell client. It runs remote commands, local scripts, stdin scripts, or an interactive shell through `gjtd`.
+- `jucp`: Jupyter copy client. It copies files or directories between local paths and `jupyter:` remote paths.
+- `gjtctl`: daemon control tool for start, stop, restart, and status.
 
-`jupyter-sh` and `jupyter-cp` are thin clients. They only talk to `jupyterd`. Non-interactive commands and file copies are submitted as background jobs, and interactive shell traffic uses a persistent local TCP stream instead of one HTTP request per key press.
+## Configuration
 
-`jupyter-ctl` starts, stops, restarts, and checks the daemon.
+The default config directory is:
+
+```bash
+/home/windy/.config/gitcode-jupyter-tool
+```
+
+By default, `gjtd` stores:
+
+- Chrome profile: `/home/windy/.config/gitcode-jupyter-tool/chrome-profile`
+- GitCode auth cache: `/home/windy/.config/gitcode-jupyter-tool/auth.json`
+- notebook state: `/home/windy/.config/gitcode-jupyter-tool/state.json`
+
+The local API and stream defaults are unchanged:
+
+```bash
+GJTD_API_URL=http://127.0.0.1:18787
+GJTD_STREAM_URL=tcp://127.0.0.1:18788
+GJTD_LOG=/tmp/gjtd.log
+GJTD_CDP_PORT=9222
+JUPYTER_CWD=~
+```
+
+The old `JUPYTERD_*` environment names are still accepted for compatibility.
+
+## Build
+
+```bash
+cargo build --release
+```
+
+The binaries are written under `target/release/`:
+
+```bash
+target/release/gjtd
+target/release/jush
+target/release/jucp
+target/release/gjtctl
+```
 
 ## Prerequisites
 
 - Linux.
-- Python 3.10 or newer.
 - Google Chrome or a compatible Chrome browser. The default executable is `google-chrome-stable`; set `CHROME` to override it.
 - Network access to `https://gitcode.com/cann/cann-learning-hub`.
 - A GitCode account that can open the CANN online notebook experience.
-- Local loopback ports are available by default:
-  - `127.0.0.1:18787` for the `jupyterd` HTTP API.
+- Local loopback ports available by default:
+  - `127.0.0.1:18787` for the `gjtd` HTTP API.
   - `127.0.0.1:18788` for the interactive shell TCP stream.
   - `127.0.0.1:9222` for Chrome DevTools.
-
-No token or cookie export is required. `jupyterd` uses a dedicated Chrome profile at `~/.config/jupyter-tool/chrome-profile`; if that profile is not logged into GitCode yet, it opens a visible Chrome window for login. Do not expose the local `jupyterd` API to untrusted networks.
 
 ## Usage
 
 Start the daemon:
 
 ```bash
-./jupyterd --interval 60 --state-file /tmp/jupyterd-state.json
+gjtctl start
 ```
 
-Or let the control script manage it:
+Check status:
 
 ```bash
-./jupyter-ctl start
-./jupyter-ctl status
-./jupyter-ctl stop
-./jupyter-ctl restart
+gjtctl status
+gjtctl status --json
 ```
 
-Interactive shell through the daemon:
+Stop or restart:
 
 ```bash
-./jupyter-sh
+gjtctl stop
+gjtctl restart
+```
+
+Run a remote interactive shell:
+
+```bash
+jush
 ```
 
 Run a command:
 
 ```bash
-./jupyter-sh -c 'pwd && npu-smi info'
+jush -c 'pwd && npu-smi info'
 ```
 
-`jupyter-sh` reads local `JUPYTER_CWD` before running remote commands. If it is unset, the remote working directory defaults to `~`.
+Run a local shell script remotely:
 
 ```bash
-JUPYTER_CWD=/workspace/notebook1 ./jupyter-sh -c pwd
-```
-
-Start the daemon automatically if needed:
-
-```bash
-./jupyter-sh --start-daemon -c 'pwd && npu-smi info'
-```
-
-Run a local shell script remotely. The script is copied to `/tmp`, executed, then removed:
-
-```bash
-./jupyter-sh ./remote-test.sh arg1 arg2
+jush ./remote-test.sh arg1 arg2
 ```
 
 Read a script from stdin:
 
 ```bash
-printf 'pwd\n' | ./jupyter-sh -s
+printf 'pwd\n' | jush -s
 ```
 
-Useful options:
+Use `JUPYTER_CWD` to set the remote working directory:
 
 ```bash
-JUPYTER_SH_TIMEOUT=600 ./jupyter-sh -c 'long-running-command'
+JUPYTER_CWD=/workspace/notebook1 jush -c pwd
 ```
 
-Press `Ctrl-D` to exit the remote shell. `Ctrl-]` force-disconnects locally.
-
-## Copy Files
-
-Use `jupyter:` to mark the Jupyter side. Exactly one side must be local and exactly one side must be remote. `jupyter:/absolute/path` is remote absolute; `jupyter:relative/path` is relative to local `JUPYTER_CWD`, or remote `~` if `JUPYTER_CWD` is unset.
-
-Upload a file:
+Copy files:
 
 ```bash
-./jupyter-cp ./local.txt jupyter:/workspace/notebook1/local.txt
-./jupyter-cp ./local.txt jupyter:local.txt
-./jupyter-cp --start-daemon ./local.txt jupyter:/workspace/notebook1/local.txt
+jucp ./local.txt jupyter:/workspace/notebook1/local.txt
+jucp jupyter:/workspace/notebook1/result.txt ./result.txt
+jucp -r ./cases jupyter:/workspace/notebook1/cases
+jucp -r jupyter:/workspace/notebook1/logs ./logs
 ```
 
-Download a file:
+Remote paths must start with `jupyter:`. Exactly one side must be local and exactly one side must be remote.
+
+## Direct daemon use
+
+Run one maintenance pass:
 
 ```bash
-./jupyter-cp jupyter:/workspace/notebook1/result.txt ./result.txt
+gjtd --once
 ```
 
-Copy directory contents recursively:
+Probe only:
 
 ```bash
-./jupyter-cp -r ./cases jupyter:/workspace/notebook1/cases
-./jupyter-cp -r jupyter:/workspace/notebook1/logs ./logs
+gjtd --status-only
 ```
 
-Remote temporary payload files are created under `/tmp` and removed automatically.
-
-## Keep Notebook Alive
-
-`jupyterd` keeps a usable GitCode CANN notebook available. Credentials stay inside the dedicated Chrome profile; the script does not decrypt or print cookies/passwords.
-
-Run one status check:
+Run the daemon in the foreground:
 
 ```bash
-./jupyterd --status-only
+gjtd --interval 60
 ```
 
-Run one maintenance pass, creating a notebook from `https://gitcode.com/cann/cann-learning-hub` if needed:
+The daemon runs Chrome headless by default. If the dedicated profile is not logged in, `gjtd` opens a visible Chrome window for login unless `--no-login-window` is set. Force visible Chrome:
 
 ```bash
-./jupyterd --once
+gjtd --visible
 ```
 
-Run continuously as the local API daemon. It runs headless by default:
-
-```bash
-./jupyterd --interval 60 --state-file /tmp/jupyterd-state.json
-```
-
-By default the HTTP API listens on `http://127.0.0.1:18787`, and the low-latency interactive shell stream listens on `tcp://127.0.0.1:18788`.
-
-Force a visible Chrome window:
-
-```bash
-./jupyterd --visible --interval 60 --state-file /tmp/jupyterd-state.json
-```
-
-If the dedicated profile is not logged in yet, headless `jupyterd` will open a visible Chrome window only for login. Disable that with `--no-login-window`.
-
-If you want to open the login/profile window manually:
-
-```bash
-./jupyterd --visible --once
-```
+Do not expose the local `gjtd` API to untrusted networks.

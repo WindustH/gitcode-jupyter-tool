@@ -1,0 +1,46 @@
+[package]
+name = "gitcode-jupyter-tool"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+name = "gitcode_jupyter_tool"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gjtd"
+path = "src/bin/gjtd.rs"
+
+[[bin]]
+name = "jush"
+path = "src/bin/jush.rs"
+
+[[bin]]
+name = "jucp"
+path = "src/bin/jucp.rs"
+
+[[bin]]
+name = "gjtctl"
+path = "src/bin/gjtctl.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1"
+httpdate = "1"
+libc = "0.2"
+nix = { version = "0.30", features = ["fs", "poll", "process", "signal", "term"] }
+once_cell = "1"
+rand = "0.8"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "charset", "json", "rustls-tls-native-roots"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+tiny_http = "0.12"
+tungstenite = { version = "0.28", default-features = false, features = ["handshake", "rustls-tls-native-roots"] }
+url = "2"
+urlencoding = "2"
