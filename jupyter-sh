@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Run commands through jupyterd."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import secrets
+import select
+import shlex
+import socket
+import sys
+import termios
+import tty
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+THIS_DIR = pathlib.Path(__file__).resolve().parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+
+import jupyter_client
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+DEFAULT_JUPYTER_CWD = "~"
+
+
+def strip_terminal_noise(text: str) -> str:
+    return ANSI_RE.sub("", text).replace("\r", "")
+
+
+def terminal_size(args: argparse.Namespace) -> tuple[int, int]:
+    fallback_rows = args.rows or 24
+    fallback_cols = args.cols or 120
+    try:
+        size = os.get_terminal_size()
+        return args.rows or size.lines, args.cols or size.columns
+    except OSError:
+        return fallback_rows, fallback_cols
+
+
+def build_script_command(path: str, script_args: list[str]) -> str:
+    raw = pathlib.Path(path).read_bytes()
+    text = raw.decode("utf-8", "surrogateescape")
+    if not text.endswith("\n"):
+        text += "\n"
+
+    delimiter = f"__JUPYTER_SH_SCRIPT_{secrets.token_hex(12)}__"
+    while delimiter in text:
+        delimiter = f"__JUPYTER_SH_SCRIPT_{secrets.token_hex(12)}__"
+
+    remote_name = pathlib.Path(path).name or "script"
+    remote_path = f"/tmp/jupyter-sh-{secrets.token_hex(8)}-{remote_name}"
+    quoted_args = " ".join(shlex.quote(arg) for arg in script_args)
+    if text.startswith("#!"):
+        runner = "\"$remote_script\""
+    else:
+        runner = "bash \"$remote_script\""
+    if quoted_args:
+        runner = f"{runner} {quoted_args}"
+
+    return "\n".join(
+        [
+            f"remote_script={shlex.quote(remote_path)}",
+            "cleanup_jupyter_sh_script() { rm -f \"$remote_script\"; }",
+            "trap cleanup_jupyter_sh_script EXIT",
+            f"cat > \"$remote_script\" <<'{delimiter}'",
+            text.rstrip("\n"),
+            delimiter,
+            "chmod +x \"$remote_script\"",
+            runner,
+            "",
+        ]
+    )
+
+
+def build_stdin_script_command(text: str, script_args: list[str]) -> str:
+    if not text.endswith("\n"):
+        text += "\n"
+    delimiter = f"__JUPYTER_SH_STDIN_{secrets.token_hex(12)}__"
+    while delimiter in text:
+        delimiter = f"__JUPYTER_SH_STDIN_{secrets.token_hex(12)}__"
+    quoted_args = " ".join(shlex.quote(arg) for arg in script_args)
+    runner = "bash -s"
+    if quoted_args:
+        runner = f"{runner} -- {quoted_args}"
+    return "\n".join([f"{runner} <<'{delimiter}'", text.rstrip("\n"), delimiter, ""])
+
+
+def build_c_command(command: str, command_args: list[str]) -> str:
+    quoted = [shlex.quote(command), *(shlex.quote(arg) for arg in command_args)]
+    return "bash -c " + " ".join(quoted)
+
+
+def remote_cwd() -> str:
+    return os.environ.get("JUPYTER_CWD") or DEFAULT_JUPYTER_CWD
+
+
+def quote_remote_path_for_shell(path: str) -> str:
+    if path == "~":
+        return "~"
+    if path.startswith("~/"):
+        return "~/" + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+def with_remote_cwd(command: str) -> str:
+    return "\n".join([f"cd {quote_remote_path_for_shell(remote_cwd())}", command])
+
+
+def command_from_args(args: argparse.Namespace) -> str | None:
+    shell_args = list(args.shell_args)
+    if shell_args and shell_args[0] == "--":
+        shell_args = shell_args[1:]
+
+    if args.command_string is not None:
+        return with_remote_cwd(build_c_command(args.command_string, shell_args))
+    if args.read_stdin:
+        return with_remote_cwd(build_stdin_script_command(sys.stdin.read(), shell_args))
+    if shell_args:
+        script_path = pathlib.Path(shell_args[0])
+        if not script_path.exists():
+            raise FileNotFoundError(f"{script_path}: No such file or directory")
+        return with_remote_cwd(build_script_command(str(script_path), shell_args[1:]))
+    if args.interactive:
+        return None
+    if not sys.stdin.isatty():
+        return with_remote_cwd(build_stdin_script_command(sys.stdin.read(), []))
+    return None
+
+
+def ensure_daemon(args: argparse.Namespace) -> None:
+    jupyter_client.ensure_daemon(
+        args.daemon_url,
+        auto_start=args.start_daemon,
+        stream_url=args.stream_url,
+        headless=args.headless,
+        log_path=args.daemon_log,
+        timeout=args.daemon_start_timeout,
+    )
+
+
+def run_command(command: str, args: argparse.Namespace) -> int:
+    ensure_daemon(args)
+    rows, cols = terminal_size(args)
+    result = jupyter_client.request(
+        args.daemon_url,
+        "/v1/run",
+        {
+            "async": True,
+            "command": command,
+            "timeout": args.timeout,
+            "rows": rows,
+            "cols": cols,
+            "raw": args.raw,
+            "no_prelude": args.no_prelude,
+        },
+        timeout=10.0,
+    )
+    if result.get("job_id"):
+        result = jupyter_client.wait_job_result(args.daemon_url, str(result["job_id"]), timeout=args.timeout + 30.0)
+    output = str(result.get("stdout", ""))
+    sys.stdout.write(output if args.raw else strip_terminal_noise(output))
+    sys.stdout.flush()
+    if not result.get("ok") and result.get("error"):
+        jupyter_client.print_error(f"jupyter-sh: {result['error']}")
+    return int(result.get("exit_code", 1 if not result.get("ok") else 0))
+
+
+def read_stream_header(sock: socket.socket, timeout: float) -> tuple[dict[str, Any], bytes]:
+    sock.settimeout(timeout)
+    data = b""
+    try:
+        while b"\n" not in data:
+            chunk = sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("jupyterd stream closed before handshake")
+            data += chunk
+            if len(data) > 65536:
+                raise RuntimeError("jupyterd stream handshake is too large")
+    finally:
+        sock.settimeout(None)
+    line, rest = data.split(b"\n", 1)
+    header = json.loads(line.decode("utf-8"))
+    return header, rest
+
+
+def interactive(args: argparse.Namespace) -> int:
+    ensure_daemon(args)
+    rows, cols = terminal_size(args)
+    stream_host, stream_port = jupyter_client.parse_tcp_url(args.stream_url)
+    sock = socket.create_connection((stream_host, stream_port), timeout=args.daemon_start_timeout)
+    sock.sendall(json.dumps({"rows": rows, "cols": cols}, ensure_ascii=False).encode("utf-8") + b"\n")
+    start, initial_output = read_stream_header(sock, args.daemon_start_timeout)
+    if not start.get("ok"):
+        raise RuntimeError(str(start.get("error") or start))
+    jupyter_client.print_error(f"Connected to {start.get('href', args.daemon_url)} through jupyterd stream.")
+    jupyter_client.print_error("Press Ctrl-D to exit the remote shell; Ctrl-] force-disconnects locally.")
+    if initial_output:
+        os.write(sys.stdout.fileno(), initial_output)
+    if remote_cwd() != DEFAULT_JUPYTER_CWD:
+        sock.sendall(f"cd {quote_remote_path_for_shell(remote_cwd())}\n".encode("utf-8"))
+
+    stdin_fd = sys.stdin.fileno()
+    old_termios = termios.tcgetattr(stdin_fd) if sys.stdin.isatty() else None
+    try:
+        if sys.stdin.isatty():
+            tty.setraw(stdin_fd)
+        sock.setblocking(False)
+        while True:
+            readable, _, _ = select.select([stdin_fd, sock], [], [], 0.05)
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 4096)
+                if not data or data == b"\x1d":
+                    break
+                sock.sendall(data)
+            if sock in readable:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                os.write(sys.stdout.fileno(), data)
+    finally:
+        if old_termios is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_termios)
+        sock.close()
+    return 0
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="jupyter-sh",
+        usage="jupyter-sh [jupyter options] [-c command | -s | script-file] [argument ...]",
+        description="Run a bash-like shell through jupyterd.",
+    )
+    parser.add_argument("-c", dest="command_string", metavar="command", help="read commands from command string")
+    parser.add_argument("-s", dest="read_stdin", action="store_true", help="read commands from standard input")
+    parser.add_argument("-i", dest="interactive", action="store_true", help="force interactive remote shell")
+    parser.add_argument("--daemon-url", default=os.environ.get("JUPYTERD_API_URL", jupyter_client.DEFAULT_API_URL))
+    parser.add_argument("--stream-url", default=os.environ.get("JUPYTERD_STREAM_URL", jupyter_client.DEFAULT_STREAM_URL))
+    parser.add_argument("--start-daemon", action="store_true", help="start jupyterd in the background if needed")
+    parser.set_defaults(headless=True)
+    parser.add_argument("--headless", action="store_true", help="when starting jupyterd, launch Chrome headless (default)")
+    parser.add_argument("--visible", dest="headless", action="store_false", help="when starting jupyterd, launch visible Chrome")
+    parser.add_argument("--daemon-log", default=os.environ.get("JUPYTERD_LOG", jupyter_client.DEFAULT_LOG))
+    parser.add_argument("--daemon-start-timeout", type=float, default=20.0)
+    parser.add_argument("--timeout", type=float, default=float(os.environ.get("JUPYTER_SH_TIMEOUT", "180")))
+    parser.add_argument("--rows", type=int, default=0)
+    parser.add_argument("--cols", type=int, default=0)
+    parser.add_argument("--raw", action="store_true", help="keep ANSI escape sequences and carriage returns")
+    parser.add_argument("--no-prelude", action="store_true", help="do not hide command echo or prompt")
+    parser.add_argument("shell_args", nargs=argparse.REMAINDER, metavar="argument")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    command = command_from_args(args)
+    if command is None:
+        return interactive(args)
+    return run_command(command, args)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        jupyter_client.print_error(f"jupyter-sh: {exc}")
+        raise SystemExit(1)

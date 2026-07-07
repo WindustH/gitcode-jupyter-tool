@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Control the local jupyterd daemon."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import signal
+import sys
+import time
+from typing import Any
+
+sys.dont_write_bytecode = True
+
+THIS_DIR = pathlib.Path(__file__).resolve().parent
+DAEMON = THIS_DIR / "jupyterd"
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+
+import jupyter_client
+
+
+def eprint(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
+def proc_cmdline(proc_dir: pathlib.Path) -> list[str]:
+    try:
+        raw = (proc_dir / "cmdline").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def proc_cwd(proc_dir: pathlib.Path) -> pathlib.Path | None:
+    try:
+        return (proc_dir / "cwd").resolve()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+
+
+def is_this_jupyterd(proc_dir: pathlib.Path, args: list[str]) -> bool:
+    cwd = proc_cwd(proc_dir)
+    for arg in args:
+        path = pathlib.Path(arg)
+        if path.is_absolute():
+            try:
+                if path.resolve() == DAEMON:
+                    return True
+            except FileNotFoundError:
+                continue
+        if cwd is not None:
+            try:
+                if (cwd / path).resolve() == DAEMON:
+                    return True
+            except FileNotFoundError:
+                continue
+    joined = " ".join(args)
+    return "jupyterd" in joined and str(THIS_DIR) in joined
+
+
+def daemon_processes() -> list[tuple[int, list[str]]]:
+    current = os.getpid()
+    matches: list[tuple[int, list[str]]] = []
+    for proc_dir in pathlib.Path("/proc").iterdir():
+        if not proc_dir.name.isdigit():
+            continue
+        pid = int(proc_dir.name)
+        if pid == current:
+            continue
+        args = proc_cmdline(proc_dir)
+        if args and is_this_jupyterd(proc_dir, args):
+            matches.append((pid, args))
+    return sorted(matches)
+
+
+def wait_until_stopped(pids: list[int], timeout: float) -> list[int]:
+    deadline = time.monotonic() + timeout
+    remaining = list(pids)
+    while remaining and time.monotonic() < deadline:
+        still_running: list[int] = []
+        for pid in remaining:
+            try:
+                os.kill(pid, 0)
+                still_running.append(pid)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                still_running.append(pid)
+        remaining = still_running
+        if remaining:
+            time.sleep(0.1)
+    return remaining
+
+
+def proc_state(pid: int) -> str:
+    try:
+        for line in pathlib.Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("State:"):
+                return line.split(":", 1)[1].strip().split()[0]
+    except (FileNotFoundError, ProcessLookupError):
+        return ""
+    except PermissionError:
+        return "?"
+    return "?"
+
+
+def stop_via_api(api_url: str, timeout: float) -> bool:
+    try:
+        response = jupyter_client.request(api_url, "/v1/shutdown", {}, timeout=2.0)
+    except Exception:
+        return False
+    if not response.get("ok"):
+        return False
+    pid = response.get("pid")
+    print(f"shutdown requested via API" + (f" pid={pid}" if pid else ""))
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        api_down = not jupyter_client.health(api_url)
+        if isinstance(pid, int):
+            state = proc_state(pid)
+            if api_down and (not state or state == "Z"):
+                return True
+        elif api_down:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def stop_processes(timeout: float, force: bool) -> int:
+    processes = daemon_processes()
+    if not processes:
+        print("jupyterd is not running")
+        return 0
+    pids = [pid for pid, _ in processes]
+    for pid in pids:
+        os.kill(pid, signal.SIGINT)
+    remaining = wait_until_stopped(pids, timeout)
+    if remaining and force:
+        for pid in remaining:
+            os.kill(pid, signal.SIGTERM)
+        remaining = wait_until_stopped(remaining, min(timeout, 5.0))
+    if remaining:
+        eprint("jupyterd did not stop: " + ", ".join(str(pid) for pid in remaining))
+        return 1
+    print("stopped jupyterd: " + ", ".join(str(pid) for pid in pids))
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    health_ok = jupyter_client.health(args.daemon_url)
+    processes = daemon_processes()
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "ok": health_ok,
+                    "api_url": args.daemon_url,
+                    "stream_url": args.stream_url,
+                    "processes": [{"pid": pid, "cmdline": cmdline} for pid, cmdline in processes],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0 if health_ok or processes else 1
+    if health_ok:
+        print(f"jupyterd API is running at {args.daemon_url}")
+    else:
+        print(f"jupyterd API is not reachable at {args.daemon_url}")
+    for pid, cmdline in processes:
+        print(f"pid {pid}: {' '.join(cmdline)}")
+    return 0 if health_ok or processes else 1
+
+
+def command_start(args: argparse.Namespace) -> int:
+    jupyter_client.start_daemon(
+        api_url=args.daemon_url,
+        stream_url=args.stream_url,
+        headless=args.headless,
+        log_path=args.daemon_log,
+        timeout=args.timeout,
+    )
+    print(f"jupyterd is running at {args.daemon_url}")
+    return 0
+
+
+def command_stop(args: argparse.Namespace) -> int:
+    if stop_via_api(args.daemon_url, args.timeout):
+        return 0
+    return stop_processes(args.timeout, args.force)
+
+
+def command_restart(args: argparse.Namespace) -> int:
+    stop_code = command_stop(args)
+    if stop_code != 0:
+        return stop_code
+    return command_start(args)
+
+
+def add_common_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--daemon-url", default=os.environ.get("JUPYTERD_API_URL", jupyter_client.DEFAULT_API_URL))
+    parser.add_argument("--stream-url", default=os.environ.get("JUPYTERD_STREAM_URL", jupyter_client.DEFAULT_STREAM_URL))
+    parser.add_argument("--daemon-log", default=os.environ.get("JUPYTERD_LOG", jupyter_client.DEFAULT_LOG))
+    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.set_defaults(headless=True)
+    parser.add_argument("--headless", action="store_true", help="start Chrome headless (default)")
+    parser.add_argument("--visible", dest="headless", action="store_false", help="start visible Chrome")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="jupyter-ctl", description="Control the local jupyterd daemon.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    status = subparsers.add_parser("status", help="show daemon status")
+    add_common_options(status)
+    status.add_argument("--json", action="store_true", help="print machine-readable status")
+    status.set_defaults(func=command_status)
+
+    start = subparsers.add_parser("start", help="start jupyterd if needed")
+    add_common_options(start)
+    start.set_defaults(func=command_start)
+
+    stop = subparsers.add_parser("stop", help="stop existing jupyterd")
+    add_common_options(stop)
+    stop.add_argument("--force", action="store_true", help="send SIGTERM if graceful stop times out")
+    stop.set_defaults(func=command_stop)
+
+    restart = subparsers.add_parser("restart", help="restart jupyterd")
+    add_common_options(restart)
+    restart.add_argument("--force", action="store_true", help="send SIGTERM if graceful stop times out")
+    restart.set_defaults(func=command_restart)
+
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        eprint(f"jupyter-ctl: {exc}")
+        raise SystemExit(1)

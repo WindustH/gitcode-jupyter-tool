@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Copy files through jupyterd."""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import os
+import pathlib
+import sys
+import tarfile
+
+sys.dont_write_bytecode = True
+
+THIS_DIR = pathlib.Path(__file__).resolve().parent
+if str(THIS_DIR) not in sys.path:
+    sys.path.insert(0, str(THIS_DIR))
+
+import jupyter_client
+
+
+class CopyError(RuntimeError):
+    pass
+
+
+REMOTE_PREFIX = "jupyter:"
+DEFAULT_JUPYTER_CWD = "~"
+
+
+def is_remote(spec: str) -> bool:
+    return spec.startswith(REMOTE_PREFIX)
+
+
+def remote_cwd() -> str:
+    return os.environ.get("JUPYTER_CWD") or DEFAULT_JUPYTER_CWD
+
+
+def remote_path(spec: str) -> str:
+    if not spec.startswith(REMOTE_PREFIX):
+        raise CopyError(f"remote path must start with jupyter:: {spec}")
+    path = spec[len(REMOTE_PREFIX) :] or "."
+    if path.startswith("/"):
+        return path
+    base = remote_cwd().rstrip("/")
+    if base in {"", "."}:
+        return path
+    if base == "~":
+        return f"~/{path}"
+    return f"{base}/{path}"
+
+
+def remote_basename(path: str) -> str:
+    stripped = path.rstrip("/")
+    return stripped.rsplit("/", 1)[-1] if stripped else "download"
+
+
+def local_destination(source_remote_path: str, destination: str) -> pathlib.Path:
+    local = pathlib.Path(destination)
+    if destination.endswith(os.sep) or local.is_dir():
+        return local / remote_basename(source_remote_path)
+    return local
+
+
+def remote_destination(source: pathlib.Path, destination: str) -> str:
+    remote = remote_path(destination)
+    if remote.endswith("/"):
+        return remote + source.name
+    return remote
+
+
+def make_directory_archive(source: pathlib.Path) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for child in source.iterdir():
+            archive.add(child, arcname=child.name, recursive=True)
+    return buffer.getvalue()
+
+
+def unpack_directory_archive(payload: bytes, destination: pathlib.Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as archive:
+        archive.extractall(destination)
+
+
+def ensure_daemon(args: argparse.Namespace) -> None:
+    jupyter_client.ensure_daemon(
+        args.daemon_url,
+        auto_start=args.start_daemon,
+        stream_url=args.stream_url,
+        headless=args.headless,
+        log_path=args.daemon_log,
+        timeout=args.daemon_start_timeout,
+    )
+
+
+def upload(args: argparse.Namespace) -> None:
+    ensure_daemon(args)
+    source = pathlib.Path(args.source)
+    if not source.exists():
+        raise CopyError(f"local source does not exist: {source}")
+
+    destination = remote_destination(source, args.destination)
+    if source.is_dir():
+        if not args.recursive:
+            raise CopyError(f"{source} is a directory; use -r to copy directories")
+        payload = make_directory_archive(source)
+        mode = 0o755
+        is_archive = True
+        label = f"directory {source}"
+    else:
+        payload = source.read_bytes()
+        mode = source.stat().st_mode & 0o777
+        is_archive = False
+        label = str(source)
+
+    result = jupyter_client.request(
+        args.daemon_url,
+        "/v1/upload",
+        {
+            "async": True,
+            "destination": destination,
+            "content_b64": base64.encodebytes(payload).decode("ascii"),
+            "mode": mode,
+            "is_archive": is_archive,
+            "timeout": args.timeout,
+            "chunk_size": args.chunk_size,
+        },
+        timeout=10.0,
+    )
+    if result.get("job_id"):
+        result = jupyter_client.wait_job_result(args.daemon_url, str(result["job_id"]), timeout=args.timeout + 30.0)
+    if not result.get("ok"):
+        raise CopyError(result.get("stdout") or result.get("error") or str(result))
+    jupyter_client.print_error(f"uploaded {label} -> jupyter:{destination}")
+
+
+def download(args: argparse.Namespace) -> None:
+    ensure_daemon(args)
+    source = remote_path(args.source)
+    destination = local_destination(source, args.destination)
+    result = jupyter_client.request(
+        args.daemon_url,
+        "/v1/download",
+        {"async": True, "source": source, "recursive": args.recursive, "timeout": args.timeout},
+        timeout=10.0,
+    )
+    if result.get("job_id"):
+        result = jupyter_client.wait_job_result(args.daemon_url, str(result["job_id"]), timeout=args.timeout + 30.0)
+    if not result.get("ok"):
+        raise CopyError(result.get("stdout") or result.get("error") or str(result))
+
+    payload = base64.b64decode(str(result.get("content_b64", "")))
+    if args.recursive:
+        unpack_directory_archive(payload, destination)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+    jupyter_client.print_error(f"downloaded jupyter:{source} -> {destination}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="jupyter-cp",
+        usage="jupyter-cp [jupyter options] [-R | -r] SOURCE DEST",
+        description="Copy between the local filesystem and jupyter: paths.",
+    )
+    parser.add_argument("-R", "-r", "--recursive", action="store_true", help="copy directories recursively")
+    parser.add_argument("source", help="local path, jupyter:/absolute/path, or jupyter:relative/path")
+    parser.add_argument("destination", help="local path, jupyter:/absolute/path, or jupyter:relative/path")
+    parser.add_argument("--daemon-url", default=os.environ.get("JUPYTERD_API_URL", jupyter_client.DEFAULT_API_URL))
+    parser.add_argument("--stream-url", default=os.environ.get("JUPYTERD_STREAM_URL", jupyter_client.DEFAULT_STREAM_URL))
+    parser.add_argument("--start-daemon", action="store_true", help="start jupyterd in the background if needed")
+    parser.set_defaults(headless=True)
+    parser.add_argument("--headless", action="store_true", help="when starting jupyterd, launch Chrome headless (default)")
+    parser.add_argument("--visible", dest="headless", action="store_false", help="when starting jupyterd, launch visible Chrome")
+    parser.add_argument("--daemon-log", default=os.environ.get("JUPYTERD_LOG", jupyter_client.DEFAULT_LOG))
+    parser.add_argument("--daemon-start-timeout", type=float, default=20.0)
+    parser.add_argument("--timeout", type=float, default=float(os.environ.get("JUPYTER_SH_TIMEOUT", "180")))
+    parser.add_argument("--chunk-size", type=int, default=262144, help="upload websocket chunk size in characters")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv or sys.argv[1:])
+    source_remote = is_remote(args.source)
+    destination_remote = is_remote(args.destination)
+    if source_remote == destination_remote:
+        raise CopyError("exactly one address must be remote, and remote paths must start with jupyter:")
+    if destination_remote:
+        upload(args)
+    else:
+        download(args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except Exception as exc:
+        jupyter_client.print_error(f"jupyter-cp: {exc}")
+        raise SystemExit(1)
