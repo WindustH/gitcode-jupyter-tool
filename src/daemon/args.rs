@@ -69,7 +69,7 @@ fn default_cdp_list_url() -> String {
 fn default_state_file() -> String {
   config::env_string(
     &["GJTD_STATE_FILE", "JUPYTERD_STATE_FILE"],
-    config::DEFAULT_STATE_FILE,
+    &config::default_state_file(),
   )
 }
 

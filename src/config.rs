@@ -2,7 +2,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 pub const APP_NAME: &str = "gitcode-jupyter-tool";
-pub const DEFAULT_CONFIG_DIR: &str = "/home/windy/.config/gitcode-jupyter-tool";
 pub const DEFAULT_HUB_URL: &str = "https://gitcode.com/cann/cann-learning-hub";
 pub const DEFAULT_REPO_URL: &str = "https://gitcode.com/cann/cann-learning-hub.git";
 pub const DEFAULT_NOTEBOOK_PATH: &str = "quick_start/cann_basics";
@@ -10,7 +9,6 @@ pub const DEFAULT_SCAN_FILE_PATH: &str = "quick_start/cann_basics/01_ai_basics.i
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:18787";
 pub const DEFAULT_STREAM_URL: &str = "tcp://127.0.0.1:18788";
 pub const DEFAULT_LOG: &str = "/tmp/gjtd.log";
-pub const DEFAULT_STATE_FILE: &str = "/home/windy/.config/gitcode-jupyter-tool/state.json";
 pub const DEFAULT_CDP_LIST_URL: &str = "http://127.0.0.1:9222/json";
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 pub const DEFAULT_LISTEN_PORT: u16 = 18787;
@@ -18,12 +16,50 @@ pub const DEFAULT_STREAM_HOST: &str = "127.0.0.1";
 pub const DEFAULT_STREAM_PORT: u16 = 18788;
 pub const DEFAULT_JUPYTER_CWD: &str = "~";
 
+pub fn default_config_dir() -> String {
+  for key in ["GJTD_CONFIG_DIR", "JUPYTERD_CONFIG_DIR"] {
+    if let Ok(value) = env::var(key) {
+      if !value.is_empty() {
+        return value;
+      }
+    }
+  }
+
+  if let Ok(value) = env::var("XDG_CONFIG_HOME") {
+    if !value.is_empty() {
+      return PathBuf::from(value)
+        .join(APP_NAME)
+        .to_string_lossy()
+        .into_owned();
+    }
+  }
+
+  home_dir()
+    .join(".config")
+    .join(APP_NAME)
+    .to_string_lossy()
+    .into_owned()
+}
+
 pub fn default_chrome_profile() -> String {
-  format!("{DEFAULT_CONFIG_DIR}/chrome-profile")
+  PathBuf::from(default_config_dir())
+    .join("chrome-profile")
+    .to_string_lossy()
+    .into_owned()
 }
 
 pub fn default_auth_cache() -> String {
-  format!("{DEFAULT_CONFIG_DIR}/auth.json")
+  PathBuf::from(default_config_dir())
+    .join("auth.json")
+    .to_string_lossy()
+    .into_owned()
+}
+
+pub fn default_state_file() -> String {
+  PathBuf::from(default_config_dir())
+    .join("state.json")
+    .to_string_lossy()
+    .into_owned()
 }
 
 pub fn default_chrome_bin() -> String {
@@ -95,6 +131,8 @@ pub fn expand_tilde(path: impl AsRef<str>) -> PathBuf {
 
 pub fn home_dir() -> PathBuf {
   env::var_os("HOME")
+    .filter(|value| !value.is_empty())
     .map(PathBuf::from)
-    .unwrap_or_else(|| PathBuf::from("/home/windy"))
+    .or_else(|| env::current_dir().ok())
+    .unwrap_or_else(|| PathBuf::from("."))
 }

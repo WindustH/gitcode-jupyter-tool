@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::ErrorKind;
 use std::io::{self, IsTerminal, Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -339,7 +339,7 @@ fn interactive(args: &Args) -> Result<i32> {
       .and_then(Value::as_str)
       .unwrap_or(&args.daemon_url)
   );
-  eprintln!("Press Ctrl-D to exit the remote shell; Ctrl-] force-disconnects locally.");
+  eprintln!("Press Ctrl-D or Ctrl-] to disconnect locally.");
   if !initial_output.is_empty() {
     io::stdout().write_all(&initial_output)?;
   }
@@ -391,7 +391,12 @@ fn raw_terminal_loop(mut sock: TcpStream) -> Result<()> {
           break;
         }
         let data = &buf[..size as usize];
-        if data == b"\x1d" {
+        let disconnect_at = data.iter().position(|byte| matches!(*byte, 0x04 | 0x1d));
+        if let Some(index) = disconnect_at {
+          if index > 0 {
+            sock.write_all(&data[..index])?;
+          }
+          let _ = sock.shutdown(Shutdown::Both);
           break;
         }
         sock.write_all(data)?;

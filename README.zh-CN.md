@@ -16,18 +16,19 @@
 默认配置目录已经改为：
 
 ```bash
-/home/windy/.config/gitcode-jupyter-tool
+${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 ```
 
 默认文件位置：
 
-- Chrome profile：`/home/windy/.config/gitcode-jupyter-tool/chrome-profile`
-- GitCode auth cache：`/home/windy/.config/gitcode-jupyter-tool/auth.json`
-- notebook state：`/home/windy/.config/gitcode-jupyter-tool/state.json`
+- Chrome profile：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/chrome-profile`
+- GitCode auth cache：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/auth.json`
+- notebook state：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/state.json`
 
 默认本地端口：
 
 ```bash
+GJTD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 GJTD_API_URL=http://127.0.0.1:18787
 GJTD_STREAM_URL=tcp://127.0.0.1:18788
 GJTD_LOG=/tmp/gjtd.log

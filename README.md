@@ -16,18 +16,19 @@ The project now builds four executables:
 The default config directory is:
 
 ```bash
-/home/windy/.config/gitcode-jupyter-tool
+${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 ```
 
 By default, `gjtd` stores:
 
-- Chrome profile: `/home/windy/.config/gitcode-jupyter-tool/chrome-profile`
-- GitCode auth cache: `/home/windy/.config/gitcode-jupyter-tool/auth.json`
-- notebook state: `/home/windy/.config/gitcode-jupyter-tool/state.json`
+- Chrome profile: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/chrome-profile`
+- GitCode auth cache: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/auth.json`
+- notebook state: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/state.json`
 
 The local API and stream defaults are unchanged:
 
 ```bash
+GJTD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 GJTD_API_URL=http://127.0.0.1:18787
 GJTD_STREAM_URL=tcp://127.0.0.1:18788
 GJTD_LOG=/tmp/gjtd.log
