@@ -356,16 +356,29 @@ impl DaemonContext {
               .unwrap_or(Value::Null)
           );
         }
+        if let Some(other_session) = self.duplicate_notebook_session(&spec.session_id, &notebook) {
+          bail!(
+            "session {} resolved to the same notebook as existing session {} (notebook_id={} base_url={}); refusing to establish a duplicate session",
+            spec.session_id,
+            other_session,
+            notebook.notebook_id,
+            notebook.base_url,
+          );
+        }
         self.direct_probe_context(client, notebook)
       })();
 
       match attempt {
         Ok(context) => return Ok(context),
         Err(err) => {
-          if allow_chrome && !force_extract_next && err.to_string().contains("auth") {
+          let err_text = err.to_string();
+          if err_text.contains("duplicate session") {
+            bail!(err_text);
+          }
+          if allow_chrome && !force_extract_next && err_text.contains("auth") {
             force_extract_next = true;
           }
-          last_error = err.to_string();
+          last_error = err_text;
         }
       }
       if Instant::now() >= deadline {

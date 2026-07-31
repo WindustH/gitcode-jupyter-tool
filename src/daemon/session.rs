@@ -190,6 +190,40 @@ impl DaemonContext {
     .ok()
   }
 
+  pub(super) fn duplicate_notebook_session(
+    &self,
+    session_id: &str,
+    notebook: &NotebookInfo,
+  ) -> Option<String> {
+    let _guard = self.state_lock.lock().unwrap();
+    let state = self.normalized_state_locked().ok()?;
+    let sessions = state.get("sessions")?.as_object()?;
+    for (other_id, session) in sessions {
+      if other_id == session_id {
+        continue;
+      }
+      let same_notebook_id = !notebook.notebook_id.is_empty()
+        && session
+          .get("notebook_id")
+          .and_then(Value::as_str)
+          .is_some_and(|value| value == notebook.notebook_id);
+      let same_base_url = !notebook.base_url.is_empty()
+        && session
+          .get("base_url")
+          .and_then(Value::as_str)
+          .is_some_and(|value| value == notebook.base_url);
+      let same_href = !notebook.lab_url.is_empty()
+        && session
+          .get("href")
+          .and_then(Value::as_str)
+          .is_some_and(|value| value == notebook.lab_url);
+      if same_notebook_id || same_base_url || same_href {
+        return Some(other_id.clone());
+      }
+    }
+    None
+  }
+
   pub(super) fn record_session_ok_state(&self, spec: &NotebookSpec, probe: &Value) -> Result<()> {
     let _guard = self.state_lock.lock().unwrap();
     let mut state = self.normalized_state_locked()?;
