@@ -67,6 +67,7 @@ struct SessionArgs {
 enum SessionCommand {
   List(SessionListArgs),
   Ensure(SessionTargetArgs),
+  Resources(SessionTargetArgs),
   MarkHeavy(SessionTargetArgs),
   UnmarkHeavy(SessionTargetArgs),
 }
@@ -438,6 +439,49 @@ fn command_session_ensure(args: &SessionTargetArgs) -> i32 {
   }
 }
 
+fn command_session_resources(args: &SessionTargetArgs) -> i32 {
+  match client::request(
+    &args.common.daemon_url,
+    "/v1/session/resources",
+    json!({"session": args.session.clone(), "timeout": args.common.timeout, "async": true}),
+    Duration::from_secs(10),
+  ) {
+    Ok(mut payload) => {
+      if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
+        match client::wait_job_result(
+          &args.common.daemon_url,
+          job_id,
+          Duration::from_secs_f64(args.common.timeout + 30.0),
+          Duration::from_millis(100),
+        ) {
+          Ok(result) => payload = result,
+          Err(err) => {
+            eprintln!("gjtctl: {err:#}");
+            return 1;
+          }
+        }
+      }
+      if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+        0
+      } else {
+        eprintln!(
+          "gjtctl: {}",
+          payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("session resource query failed")
+        );
+        1
+      }
+    }
+    Err(err) => {
+      eprintln!("gjtctl: {err:#}");
+      1
+    }
+  }
+}
+
 fn command_session_request(args: &SessionTargetArgs, path: &str) -> i32 {
   match client::request(
     &args.common.daemon_url,
@@ -471,6 +515,7 @@ fn command_session(args: &SessionArgs) -> i32 {
   match &args.command {
     SessionCommand::List(args) => command_session_list(args),
     SessionCommand::Ensure(args) => command_session_ensure(args),
+    SessionCommand::Resources(args) => command_session_resources(args),
     SessionCommand::MarkHeavy(args) => command_session_request(args, "/v1/session/mark-heavy"),
     SessionCommand::UnmarkHeavy(args) => command_session_request(args, "/v1/session/unmark-heavy"),
   }

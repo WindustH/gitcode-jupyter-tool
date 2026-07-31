@@ -178,6 +178,22 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
     }
+    "/v1/session/resources" => {
+      let timeout =
+        Duration::from_secs_f64(body.get("timeout").and_then(Value::as_f64).unwrap_or(60.0));
+      let session = requested_session(&body);
+      if async_job {
+        let jobs = service.jobs.clone();
+        let service_for_job = Arc::clone(&service);
+        jobs.submit("session-resources", move || {
+          service_for_job.session_resources(session, timeout)
+        })
+      } else {
+        service
+          .session_resources(session, timeout)
+          .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
+      }
+    }
     "/v1/terminal/start" => {
       let (rows, cols) = terminal_rows_cols(
         body.get("rows").and_then(Value::as_u64),

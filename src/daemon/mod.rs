@@ -29,6 +29,171 @@ use terminal::{LiveTerminal, drain_api_terminal, wait_api_command_marker};
 
 const DOWNLOAD_BEGIN_MARK: &str = "__GJTD_DOWNLOAD_BEGIN__";
 const DOWNLOAD_END_MARK: &str = "__GJTD_DOWNLOAD_END__";
+const SESSION_RESOURCES_COMMAND: &str = r#"python3 - <<'PY'
+import json
+import os
+import pathlib
+import platform
+import re
+import shutil
+import subprocess
+import time
+
+
+def limited(text, limit):
+    if text is None:
+        return ""
+    return text[-limit:]
+
+
+def run(cmd, timeout=8):
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "ok": proc.returncode == 0,
+            "returncode": proc.returncode,
+            "stdout": limited(proc.stdout, 12000),
+            "stderr": limited(proc.stderr, 4000),
+        }
+    except FileNotFoundError:
+        return {"ok": False, "error": "command not found", "command": cmd[0]}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "command": cmd}
+
+
+def read_text(path, limit=4000):
+    try:
+        return pathlib.Path(path).read_text(errors="replace")[:limit]
+    except Exception:
+        return None
+
+
+def meminfo():
+    data = {}
+    text = read_text("/proc/meminfo", 20000) or ""
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, rest = line.split(":", 1)
+        parts = rest.strip().split()
+        if parts and parts[0].isdigit():
+            value_kib = int(parts[0])
+            data[key] = {"kib": value_kib, "bytes": value_kib * 1024}
+        else:
+            data[key] = rest.strip()
+    return data
+
+
+def cpuinfo():
+    text = read_text("/proc/cpuinfo", 200000) or ""
+    models = []
+    physical_cores = set()
+    current = {}
+    for line in text.splitlines() + [""]:
+        if not line.strip():
+            if current:
+                model = current.get("model name") or current.get("Processor") or current.get("Hardware")
+                if model and model not in models:
+                    models.append(model)
+                if "physical id" in current and "core id" in current:
+                    physical_cores.add((current["physical id"], current["core id"]))
+                current = {}
+            continue
+        if ":" in line:
+            key, value = line.split(":", 1)
+            current[key.strip()] = value.strip()
+    return {
+        "architecture": platform.machine(),
+        "logical_count": os.cpu_count(),
+        "physical_core_count": len(physical_cores) or None,
+        "models": models[:8],
+    }
+
+
+def disk_usage(path):
+    try:
+        usage = shutil.disk_usage(path)
+        return {
+            "path": path,
+            "total_bytes": usage.total,
+            "used_bytes": usage.used,
+            "free_bytes": usage.free,
+        }
+    except Exception as exc:
+        return {"path": path, "error": str(exc)}
+
+
+def cann_versions():
+    candidates = [
+        "/usr/local/Ascend/ascend-toolkit/latest/version.info",
+        "/usr/local/Ascend/ascend-toolkit/latest/compiler/version.info",
+        os.path.expandvars("$ASCEND_HOME/version.info"),
+        os.path.expandvars("$ASCEND_TOOLKIT_HOME/version.info"),
+    ]
+    out = []
+    seen = set()
+    for path in candidates:
+        if not path or "$" in path or path in seen:
+            continue
+        seen.add(path)
+        text = read_text(path, 4000)
+        if text:
+            out.append({"path": path, "text": text})
+    return out
+
+
+npu_smi = run(["npu-smi", "info"], timeout=10)
+which_npu_smi = shutil.which("npu-smi")
+selected_env = {
+    key: value
+    for key, value in os.environ.items()
+    if key in {
+        "ASCEND_HOME",
+        "ASCEND_TOOLKIT_HOME",
+        "ASCEND_CUSTOM_OPP_PATH",
+        "ASCEND_OPP_PATH",
+        "ASCEND_AICPU_PATH",
+        "ASCEND_VISIBLE_DEVICES",
+        "NPU_VISIBLE_DEVICES",
+    }
+}
+
+workspace_paths = ["/", os.path.expanduser("~"), os.getcwd(), "/workspace"]
+seen_paths = []
+for path in workspace_paths:
+    if path not in seen_paths and os.path.exists(path):
+        seen_paths.append(path)
+
+print(json.dumps({
+    "schema_version": 1,
+    "collected_at_unix": time.time(),
+    "system": {
+        "hostname": platform.node(),
+        "platform": platform.platform(),
+        "kernel": platform.release(),
+        "python": platform.python_version(),
+        "cwd": os.getcwd(),
+    },
+    "cpu": cpuinfo(),
+    "memory": meminfo(),
+    "disk": [disk_usage(path) for path in seen_paths],
+    "npu": {
+        "npu_smi_path": which_npu_smi,
+        "npu_smi_info": npu_smi,
+    },
+    "cann": {
+        "env": selected_env,
+        "version_files": cann_versions(),
+    },
+}, ensure_ascii=False, sort_keys=True))
+PY
+"#;
 struct DirectContext {
   client: HttpClient,
   notebook: NotebookInfo,
@@ -495,6 +660,19 @@ impl DaemonContext {
   }
 }
 
+fn parse_json_object_from_stdout(text: &str) -> Result<Value> {
+  let start = text
+    .find('{')
+    .ok_or_else(|| anyhow!("resource probe did not print JSON"))?;
+  let end = text
+    .rfind('}')
+    .ok_or_else(|| anyhow!("resource probe did not print complete JSON"))?;
+  if end < start {
+    bail!("resource probe printed malformed JSON");
+  }
+  serde_json::from_str(&text[start..=end]).with_context(|| "parse resource probe JSON")
+}
+
 struct Service {
   context: Arc<DaemonContext>,
   jobs: JobManager,
@@ -836,6 +1014,31 @@ printf '%s\n' {end}
       "content_b64": payload,
       "href": result.get("href").cloned().unwrap_or(Value::Null),
       "session": result.get("session").cloned().unwrap_or(Value::Null),
+    }))
+  }
+
+  fn session_resources(&self, session: Option<String>, timeout: Duration) -> Result<Value> {
+    let result = self.run_command(
+      SESSION_RESOURCES_COMMAND.to_string(),
+      timeout,
+      40,
+      160,
+      false,
+      false,
+      true,
+      session,
+      false,
+    )?;
+    if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+      return Ok(result);
+    }
+    let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let resources = parse_json_object_from_stdout(stdout)?;
+    Ok(json!({
+      "ok": true,
+      "session": result.get("session").cloned().unwrap_or(Value::Null),
+      "href": result.get("href").cloned().unwrap_or(Value::Null),
+      "resources": resources,
     }))
   }
 
