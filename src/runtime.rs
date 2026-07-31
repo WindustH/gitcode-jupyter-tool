@@ -105,11 +105,9 @@ pub fn fetch_json(url: &str, timeout: Duration) -> Result<Value> {
     .header(reqwest::header::ACCEPT, "application/json")
     .send()
     .with_context(|| format!("GET {url}"))?;
-  Ok(
-    response
-      .json()
-      .with_context(|| format!("parse JSON from {url}"))?,
-  )
+  response
+    .json()
+    .with_context(|| format!("parse JSON from {url}"))
 }
 
 pub fn fetch_targets(cdp_list_url: &str) -> Result<Vec<Value>> {
@@ -253,14 +251,12 @@ impl CdpClient {
 
   fn handle_event(&mut self, message: &Value) {
     let method = message.get("method").and_then(Value::as_str).unwrap_or("");
-    if method == "Runtime.executionContextCreated" {
-      if let Some(context) = message.pointer("/params/context") {
-        if context.pointer("/auxData/type").and_then(Value::as_str) == Some("default") {
-          if let Some(id) = context.get("id").and_then(Value::as_i64) {
-            self.contexts.insert(id, context.clone());
-          }
-        }
-      }
+    if method == "Runtime.executionContextCreated"
+      && let Some(context) = message.pointer("/params/context")
+      && context.pointer("/auxData/type").and_then(Value::as_str) == Some("default")
+      && let Some(id) = context.get("id").and_then(Value::as_i64)
+    {
+      self.contexts.insert(id, context.clone());
     }
   }
 }

@@ -264,10 +264,10 @@ fn parse_set_cookie(url: &str, raw: &str) -> Option<Cookie> {
         }
       }
       "expires" => {
-        if let Ok(time) = httpdate::parse_http_date(value) {
-          if let Ok(duration) = time.duration_since(UNIX_EPOCH) {
-            cookie.expires = Some(duration.as_secs_f64());
-          }
+        if let Ok(time) = httpdate::parse_http_date(value)
+          && let Ok(duration) = time.duration_since(UNIX_EPOCH)
+        {
+          cookie.expires = Some(duration.as_secs_f64());
         }
       }
       _ => {}
@@ -382,7 +382,7 @@ impl HttpClient {
     if bytes.is_empty() {
       return Ok(Value::Null);
     }
-    Ok(serde_json::from_slice(&bytes).with_context(|| format!("expected JSON from {url}"))?)
+    serde_json::from_slice(&bytes).with_context(|| format!("expected JSON from {url}"))
   }
 
   fn update_cookies(&mut self, url: &str, headers: &HeaderMap) -> Result<()> {

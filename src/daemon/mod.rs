@@ -1,19 +1,21 @@
 mod args;
 mod http;
 mod jobs;
+mod session;
 mod stream;
 mod terminal;
 
 use crate::config;
 use crate::direct::{self, ApiTerminal, CookieAuth, HttpClient, NotebookInfo};
 use crate::runtime;
-use crate::util::{log, shell_quote, token_hex, write_json_file};
+use crate::util::{log, shell_quote, token_hex};
 use anyhow::{Context, Result, anyhow, bail};
 use args::Args;
 use clap::Parser;
 use http::run_http_server;
 use jobs::JobManager;
 use serde_json::{Value, json};
+use session::{NotebookSpec, SessionLease};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -37,6 +39,7 @@ struct DirectContext {
 struct DaemonContext {
   args: Args,
   chrome: Mutex<Option<Child>>,
+  state_lock: Mutex<()>,
 }
 
 impl DaemonContext {
@@ -44,6 +47,7 @@ impl DaemonContext {
     Self {
       args,
       chrome: Mutex::new(None),
+      state_lock: Mutex::new(()),
     }
   }
 
@@ -225,36 +229,13 @@ impl DaemonContext {
     allow_chrome: bool,
     headless: bool,
   ) -> Result<CookieAuth> {
-    if !force_extract {
-      if let Some(auth) = self.load_cached_auth() {
-        return Ok(auth);
-      }
+    if !force_extract && let Some(auth) = self.load_cached_auth() {
+      return Ok(auth);
     }
     if !allow_chrome {
       bail!("GitCode auth cache is missing or expired");
     }
     self.extract_auth_from_chrome(headless)
-  }
-
-  fn previous_notebook_from_state(&self) -> Option<NotebookInfo> {
-    let path = self.state_file_path();
-    let text = fs::read_to_string(&path).ok()?;
-    let data: Value = serde_json::from_str(&text).ok()?;
-    let href = data.get("href")?.as_str()?.to_string();
-    if !href.contains("aihub-run.gitcode.com") {
-      return None;
-    }
-    direct::notebook_from_lab_url(
-      &href,
-      data.get("target_url").and_then(Value::as_str).unwrap_or(""),
-      json!({
-          "state_file": path.display().to_string(),
-          "state_time": data.get("time").cloned().unwrap_or(Value::Null),
-          "status": data.get("status").cloned().unwrap_or_else(|| json!({})),
-          "notebook_id": data.get("notebook_id").cloned().unwrap_or(Value::Null),
-      }),
-    )
-    .ok()
   }
 
   fn direct_probe_output(&self, status: &Value, notebook: &NotebookInfo) -> String {
@@ -317,6 +298,7 @@ impl DaemonContext {
 
   fn direct_context(
     &self,
+    spec: &NotebookSpec,
     timeout: Duration,
     force_auth_extract: bool,
     allow_chrome: bool,
@@ -331,17 +313,23 @@ impl DaemonContext {
       let attempt = (|| {
         let auth = self.get_direct_auth(force_extract_next, allow_chrome, headless)?;
         let client = HttpClient::new(auth, Some(self.auth_cache_path()))?;
-        if !previous_dead {
-          if let Some(previous) = self.previous_notebook_from_state() {
-            match self.direct_probe_context(client, previous.clone()) {
-              Ok(context) => {
-                log(format!("reusing previous notebook: {}", previous.base_url));
-                return Ok(context);
-              }
-              Err(err) => {
-                previous_dead = true;
-                log(format!("previous notebook is not reusable: {err}"));
-              }
+        if !previous_dead
+          && let Some(previous) = self.previous_notebook_from_session_state(&spec.session_id)
+        {
+          match self.direct_probe_context(client, previous.clone()) {
+            Ok(context) => {
+              log(format!(
+                "reusing previous notebook for session {}: {}",
+                spec.session_id, previous.base_url
+              ));
+              return Ok(context);
+            }
+            Err(err) => {
+              previous_dead = true;
+              log(format!(
+                "previous notebook for session {} is not reusable: {err}",
+                spec.session_id
+              ));
             }
           }
         }
@@ -349,12 +337,12 @@ impl DaemonContext {
         let mut client = HttpClient::new(auth, Some(self.auth_cache_path()))?;
         let notebook = direct::insert_notebook(
           &mut client,
-          &self.args.repo_url,
-          &self.args.ttl,
-          &self.args.disk_size,
-          &self.args.notebook_path,
-          &self.args.scan_file_path,
-          &self.args.gitcode_user,
+          &spec.repo_url,
+          &spec.ttl,
+          &spec.disk_size,
+          &spec.notebook_path,
+          &spec.scan_file_path,
+          &spec.gitcode_user,
           Duration::from_secs_f64(self.args.insert_timeout),
         )?;
         if !notebook.provisioning_status.is_empty() && notebook.provisioning_status != "READY" {
@@ -387,33 +375,7 @@ impl DaemonContext {
     }
   }
 
-  fn write_state(&self, data: Value) -> Result<()> {
-    if self.args.state_file.is_empty() {
-      return Ok(());
-    }
-    write_json_file(&self.state_file_path(), &data)
-  }
-
-  fn record_ok_state(&self, probe: &Value) -> Result<()> {
-    let status = probe.get("status").cloned().unwrap_or_else(|| json!({}));
-    self.write_state(json!({
-        "ok": true,
-        "href": probe.get("href").cloned().unwrap_or(Value::Null),
-        "target_url": probe.get("target_url").cloned().unwrap_or(Value::Null),
-        "notebook_id": probe.get("notebook_id").cloned().unwrap_or(Value::Null),
-        "base_url": probe.get("base_url").cloned().unwrap_or(Value::Null),
-        "status": status,
-        "remote_started": status.get("started").cloned().unwrap_or(Value::Null),
-        "remote_last_activity": status.get("last_activity").cloned().unwrap_or(Value::Null),
-        "target_url_contains": self.args.notebook_target_contains,
-        "page_url_contains": self.args.notebook_page_contains,
-        "profile": config::expand_tilde(&self.args.chrome_user_data_dir).display().to_string(),
-        "probe": probe.get("output").cloned().unwrap_or(Value::Null),
-        "time": direct::now(),
-    }))
-  }
-
-  fn open_login_window_and_wait(&self, reason: &str) -> Result<bool> {
+  fn open_login_window_and_wait(&self, spec: &NotebookSpec, reason: &str) -> Result<bool> {
     if self.args.no_login_window {
       bail!("notebook is unavailable and login window is disabled: {reason}");
     }
@@ -429,6 +391,7 @@ impl DaemonContext {
     let mut last_error = String::new();
     while Instant::now() < deadline {
       match self.direct_context(
+        spec,
         Duration::from_secs_f64(self.args.login_probe_interval.max(1.0)),
         true,
         true,
@@ -450,7 +413,7 @@ impl DaemonContext {
               .unwrap_or("")
               .replace('\n', " ; ")
           ));
-          self.record_ok_state(&context.probe)?;
+          self.record_session_ok_state(spec, &context.probe)?;
           return Ok(true);
         }
         Err(err) => last_error = err.to_string(),
@@ -461,46 +424,61 @@ impl DaemonContext {
   }
 
   fn maintain_once(&self) -> Result<bool> {
-    match self.direct_context(
-      Duration::from_secs_f64(self.args.direct_timeout),
-      false,
-      !self.args.no_launch,
-      self.args.headless(),
-      false,
-    ) {
-      Ok(context) => {
-        log(format!(
-          "notebook ok: {} | {}",
-          context
-            .probe
-            .get("href")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-          context
-            .probe
-            .get("output")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .replace('\n', " ; ")
-        ));
-        self.record_ok_state(&context.probe)?;
-        return Ok(true);
-      }
-      Err(err) => {
-        log(format!("notebook not ready: {err}"));
-        if self.args.status_only {
-          self.write_state(json!({"ok": false, "reason": "status_only", "time": direct::now()}))?;
-          return Ok(false);
+    let mut any_ok = false;
+    for session_id in self.configured_session_ids() {
+      let spec = self.session_spec(&session_id)?;
+      match self.direct_context(
+        &spec,
+        Duration::from_secs_f64(self.args.direct_timeout),
+        false,
+        !self.args.no_launch,
+        self.args.headless(),
+        false,
+      ) {
+        Ok(context) => {
+          log(format!(
+            "session {} notebook ok: {} | {}",
+            spec.session_id,
+            context
+              .probe
+              .get("href")
+              .and_then(Value::as_str)
+              .unwrap_or(""),
+            context
+              .probe
+              .get("output")
+              .and_then(Value::as_str)
+              .unwrap_or("")
+              .replace('\n', " ; ")
+          ));
+          self.record_session_ok_state(&spec, &context.probe)?;
+          any_ok = true;
         }
-        self.write_state(
-          json!({"ok": false, "reason": "direct_probe_failed", "time": direct::now()}),
-        )?;
-        if !self.args.no_login_window && !self.args.no_launch {
-          return self.open_login_window_and_wait("direct probe failed");
+        Err(err) => {
+          log(format!(
+            "session {} notebook not ready: {err}",
+            spec.session_id
+          ));
+          self.record_session_failure(
+            &spec.session_id,
+            if self.args.status_only {
+              "status_only"
+            } else {
+              "direct_probe_failed"
+            },
+          )?;
+          if self.args.status_only {
+            continue;
+          }
+          if !self.args.no_login_window && !self.args.no_launch {
+            any_ok |= self.open_login_window_and_wait(&spec, "direct probe failed")?;
+            continue;
+          }
+          bail!("direct notebook probe failed and browser launch is disabled");
         }
-        bail!("direct notebook probe failed and browser launch is disabled");
       }
     }
+    Ok(any_ok)
   }
 }
 
@@ -522,22 +500,77 @@ impl Service {
     }
   }
 
-  fn direct_context(&self, skip_previous: bool) -> Result<DirectContext> {
+  fn acquire_session(
+    &self,
+    session: Option<String>,
+    heavy: bool,
+    lease_duration: Duration,
+  ) -> Result<SessionLease> {
+    SessionLease::acquire(Arc::clone(&self.context), session, heavy, lease_duration)
+  }
+
+  fn direct_context_with_options(
+    &self,
+    lease: &SessionLease,
+    timeout: Duration,
+    force_auth_extract: bool,
+    allow_chrome: bool,
+    skip_previous: bool,
+  ) -> Result<DirectContext> {
     let _guard = self.ensure_lock.lock().unwrap();
+    let spec = self.context.session_spec(&lease.session_id)?;
     let context = self.context.direct_context(
-      Duration::from_secs_f64(self.context.args.create_timeout),
-      false,
-      !self.context.args.no_launch,
+      &spec,
+      timeout,
+      force_auth_extract,
+      allow_chrome,
       self.context.args.headless(),
       skip_previous,
     )?;
-    self.context.record_ok_state(&context.probe)?;
+    self
+      .context
+      .record_session_ok_state(&spec, &context.probe)?;
     Ok(context)
   }
 
+  fn direct_context(&self, lease: &SessionLease, skip_previous: bool) -> Result<DirectContext> {
+    self.direct_context_with_options(
+      lease,
+      Duration::from_secs_f64(self.context.args.create_timeout),
+      false,
+      !self.context.args.no_launch,
+      skip_previous,
+    )
+  }
+
+  fn ensure_one(&self, session: Option<String>) -> Result<Value> {
+    let lease = self.acquire_session(
+      session,
+      false,
+      Duration::from_secs_f64(self.context.args.create_timeout + 60.0),
+    )?;
+    let context = self.direct_context(&lease, false)?;
+    Ok(json!({
+      "ok": true,
+      "session": lease.session_id,
+      "href": context.notebook.lab_url,
+      "status": context.status,
+    }))
+  }
+
+  fn ensure_session(&self, session: Option<String>) -> Result<Value> {
+    if session.is_some() {
+      return self.ensure_one(session);
+    }
+    let mut sessions = Vec::new();
+    for id in self.context.configured_session_ids() {
+      sessions.push(self.ensure_one(Some(id))?);
+    }
+    Ok(json!({"ok": true, "sessions": sessions}))
+  }
+
   fn ensure(&self) -> Result<Value> {
-    let context = self.direct_context(false)?;
-    Ok(json!({"ok": true, "href": context.notebook.lab_url, "status": context.status}))
+    self.ensure_session(None)
   }
 
   fn run_command(
@@ -549,17 +582,24 @@ impl Service {
     raw: bool,
     no_prelude: bool,
     ensure: bool,
+    session: Option<String>,
+    heavy: bool,
   ) -> Result<Value> {
+    let lease = self.acquire_session(
+      session,
+      heavy,
+      Duration::from_secs_f64(timeout.as_secs_f64() + 60.0),
+    )?;
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
       let context = if ensure {
-        self.direct_context(attempt > 0)?
+        self.direct_context(&lease, attempt > 0)?
       } else {
-        self.context.direct_context(
+        self.direct_context_with_options(
+          &lease,
           Duration::from_secs_f64(self.context.args.direct_timeout),
           false,
           false,
-          self.context.args.headless(),
           attempt > 0,
         )?
       };
@@ -583,9 +623,13 @@ impl Service {
         .join("\n");
         terminal.send(&wrapped)?;
         let (status, text) = wait_api_command_marker(&mut terminal, &marker, timeout, raw)?;
-        Ok(
-          json!({"ok": status == 0, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}),
-        )
+        Ok(json!({
+          "ok": status == 0,
+          "exit_code": status,
+          "stdout": text,
+          "href": context.notebook.lab_url,
+          "session": lease.session_id,
+        }))
       })() {
         Ok(result) => {
           terminal.close();
@@ -595,7 +639,10 @@ impl Service {
           terminal.close();
           last_error = Some(err);
           if attempt == 0 {
-            log("remote command failed on current notebook; replacing notebook");
+            log(format!(
+              "remote command failed on session {}; replacing notebook",
+              lease.session_id
+            ));
           }
         }
       }
@@ -616,6 +663,8 @@ impl Service {
     is_archive: bool,
     timeout: Duration,
     chunk_size: usize,
+    session: Option<String>,
+    heavy: bool,
   ) -> Result<Value> {
     let marker = format!("__GJTD_UPLOAD_{}__:", token_hex(8));
     let heredoc = format!("__GJTD_UPLOAD_PAYLOAD_{}__", token_hex(8));
@@ -633,9 +682,14 @@ impl Service {
         mode = mode_octal
       )
     };
+    let lease = self.acquire_session(
+      session,
+      heavy,
+      Duration::from_secs_f64(timeout.as_secs_f64() + 60.0),
+    )?;
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
-      let context = self.direct_context(attempt > 0)?;
+      let context = self.direct_context(&lease, attempt > 0)?;
       let mut terminal = ApiTerminal::new(context.client, context.notebook.clone(), 24, 120);
       let result = (|| {
         terminal.start(Duration::from_secs(30))?;
@@ -670,9 +724,13 @@ impl Service {
           .join("\n"),
         )?;
         let (status, text) = wait_api_command_marker(&mut terminal, &marker, timeout, false)?;
-        Ok(
-          json!({"ok": status == 0, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}),
-        )
+        Ok(json!({
+          "ok": status == 0,
+          "exit_code": status,
+          "stdout": text,
+          "href": context.notebook.lab_url,
+          "session": lease.session_id,
+        }))
       })();
       terminal.close();
       match result {
@@ -680,7 +738,10 @@ impl Service {
         Err(err) => {
           last_error = Some(err);
           if attempt == 0 {
-            log("upload failed on current notebook; replacing notebook");
+            log(format!(
+              "upload failed on session {}; replacing notebook",
+              lease.session_id
+            ));
           }
         }
       }
@@ -691,7 +752,14 @@ impl Service {
     )
   }
 
-  fn download(&self, source: String, recursive: bool, timeout: Duration) -> Result<Value> {
+  fn download(
+    &self,
+    source: String,
+    recursive: bool,
+    timeout: Duration,
+    session: Option<String>,
+    heavy: bool,
+  ) -> Result<Value> {
     let source_arg = shell_quote(&source);
     let command = if recursive {
       format!(
@@ -724,7 +792,9 @@ printf '%s\n' {end}
         end = shell_quote(DOWNLOAD_END_MARK),
       )
     };
-    let result = self.run_command(command, timeout, 24, 120, false, false, true)?;
+    let result = self.run_command(
+      command, timeout, 24, 120, false, false, true, session, heavy,
+    )?;
     if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
       return Ok(result);
     }
@@ -747,28 +817,49 @@ printf '%s\n' {end}
     let payload = stdout[begin + DOWNLOAD_BEGIN_MARK.len()..end]
       .split_whitespace()
       .collect::<String>();
-    Ok(
-      json!({"ok": true, "exit_code": 0, "content_b64": payload, "href": result.get("href").cloned().unwrap_or(Value::Null)}),
-    )
+    Ok(json!({
+      "ok": true,
+      "exit_code": 0,
+      "content_b64": payload,
+      "href": result.get("href").cloned().unwrap_or(Value::Null),
+      "session": result.get("session").cloned().unwrap_or(Value::Null),
+    }))
   }
 
-  fn open_terminal(&self, rows: u16, cols: u16) -> Result<Arc<LiveTerminal>> {
-    match LiveTerminal::new(self, rows, cols) {
+  fn open_terminal(
+    &self,
+    rows: u16,
+    cols: u16,
+    session: Option<String>,
+    heavy: bool,
+  ) -> Result<Arc<LiveTerminal>> {
+    let lease = self.acquire_session(session, heavy, Duration::from_secs(24 * 60 * 60))?;
+    match LiveTerminal::new(self, lease, rows, cols) {
       Ok(terminal) => Ok(Arc::new(terminal)),
-      Err(_) => {
-        let _ = self.ensure();
-        Ok(Arc::new(LiveTerminal::new(self, rows, cols)?))
-      }
+      Err(err) => Err(err),
     }
   }
 
-  fn start_terminal(&self, rows: u16, cols: u16) -> Result<Value> {
-    let terminal = self.open_terminal(rows, cols)?;
+  fn start_terminal(
+    &self,
+    rows: u16,
+    cols: u16,
+    session: Option<String>,
+    heavy: bool,
+  ) -> Result<Value> {
+    let terminal = self.open_terminal(rows, cols, session, heavy)?;
     let initial_output = terminal.prepare_interactive_prompt()?;
     let id = terminal.id.clone();
     let href = terminal.href.clone();
+    let session = terminal.session_id.clone();
     self.terminals.write().unwrap().insert(id.clone(), terminal);
-    Ok(json!({"ok": true, "id": id, "href": href, "initial_output": initial_output}))
+    Ok(json!({
+      "ok": true,
+      "id": id,
+      "href": href,
+      "session": session,
+      "initial_output": initial_output,
+    }))
   }
 
   fn get_terminal(&self, id: &str) -> Result<Arc<LiveTerminal>> {

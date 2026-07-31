@@ -18,20 +18,20 @@ pub const DEFAULT_JUPYTER_CWD: &str = "~";
 
 pub fn default_config_dir() -> String {
   for key in ["GJTD_CONFIG_DIR", "JUPYTERD_CONFIG_DIR"] {
-    if let Ok(value) = env::var(key) {
-      if !value.is_empty() {
-        return value;
-      }
+    if let Ok(value) = env::var(key)
+      && !value.is_empty()
+    {
+      return value;
     }
   }
 
-  if let Ok(value) = env::var("XDG_CONFIG_HOME") {
-    if !value.is_empty() {
-      return PathBuf::from(value)
-        .join(APP_NAME)
-        .to_string_lossy()
-        .into_owned();
-    }
+  if let Ok(value) = env::var("XDG_CONFIG_HOME")
+    && !value.is_empty()
+  {
+    return PathBuf::from(value)
+      .join(APP_NAME)
+      .to_string_lossy()
+      .into_owned();
   }
 
   home_dir()
@@ -63,10 +63,10 @@ pub fn default_state_file() -> String {
 }
 
 pub fn default_chrome_bin() -> String {
-  if let Ok(value) = env::var("CHROME") {
-    if !value.is_empty() {
-      return value;
-    }
+  if let Ok(value) = env::var("CHROME")
+    && !value.is_empty()
+  {
+    return value;
   }
   if Path::new("/opt/google/chrome/google-chrome").exists() {
     return "/opt/google/chrome/google-chrome".to_string();
@@ -76,10 +76,10 @@ pub fn default_chrome_bin() -> String {
 
 pub fn env_string(keys: &[&str], default: &str) -> String {
   for key in keys {
-    if let Ok(value) = env::var(key) {
-      if !value.is_empty() {
-        return value;
-      }
+    if let Ok(value) = env::var(key)
+      && !value.is_empty()
+    {
+      return value;
     }
   }
   default.to_string()
@@ -87,10 +87,10 @@ pub fn env_string(keys: &[&str], default: &str) -> String {
 
 pub fn env_f64(keys: &[&str], default: f64) -> f64 {
   for key in keys {
-    if let Ok(value) = env::var(key) {
-      if let Ok(parsed) = value.parse::<f64>() {
-        return parsed;
-      }
+    if let Ok(value) = env::var(key)
+      && let Ok(parsed) = value.parse::<f64>()
+    {
+      return parsed;
     }
   }
   default
@@ -98,10 +98,10 @@ pub fn env_f64(keys: &[&str], default: f64) -> f64 {
 
 pub fn env_u16(keys: &[&str], default: u16) -> u16 {
   for key in keys {
-    if let Ok(value) = env::var(key) {
-      if let Ok(parsed) = value.parse::<u16>() {
-        return parsed;
-      }
+    if let Ok(value) = env::var(key)
+      && let Ok(parsed) = value.parse::<u16>()
+    {
+      return parsed;
     }
   }
   default
@@ -109,10 +109,10 @@ pub fn env_u16(keys: &[&str], default: u16) -> u16 {
 
 pub fn env_u64(keys: &[&str], default: u64) -> u64 {
   for key in keys {
-    if let Ok(value) = env::var(key) {
-      if let Ok(parsed) = value.parse::<u64>() {
-        return parsed;
-      }
+    if let Ok(value) = env::var(key)
+      && let Ok(parsed) = value.parse::<u64>()
+    {
+      return parsed;
     }
   }
   default

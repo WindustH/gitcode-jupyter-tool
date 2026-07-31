@@ -74,7 +74,7 @@ pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
 
 pub fn read_json_file<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
   let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-  Ok(serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?)
+  serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
 }
 
 pub fn write_json_file(path: &Path, value: &serde_json::Value) -> Result<()> {
