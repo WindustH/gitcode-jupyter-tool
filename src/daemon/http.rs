@@ -8,14 +8,6 @@ use std::thread;
 use std::time::Duration;
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
-fn requested_session(body: &Value) -> Option<String> {
-  body
-    .get("session")
-    .and_then(Value::as_str)
-    .filter(|value| !value.is_empty())
-    .map(ToString::to_string)
-}
-
 fn requested_heavy(body: &Value) -> bool {
   body.get("heavy").and_then(Value::as_bool).unwrap_or(false)
 }
@@ -32,35 +24,16 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
       .get(body.get("id").and_then(Value::as_str).unwrap_or(""))
       .map(|job| json!({"ok": true, "job": job}))
       .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()})),
-    "/v1/sessions" => service
-      .context
-      .sessions_status()
-      .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()})),
-    "/v1/session/ensure" | "/v1/ensure" => {
-      let session = requested_session(&body);
+    "/v1/ensure" => {
       if async_job {
         let jobs = service.jobs.clone();
         let service_for_job = Arc::clone(&service);
-        jobs.submit("ensure", move || service_for_job.ensure_session(session))
+        jobs.submit("ensure", move || service_for_job.ensure())
       } else {
         service
-          .ensure_session(session)
+          .ensure()
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
-    }
-    "/v1/session/mark-heavy" => {
-      let session = body.get("session").and_then(Value::as_str).unwrap_or("");
-      service
-        .context
-        .set_manual_heavy(session, true)
-        .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
-    }
-    "/v1/session/unmark-heavy" => {
-      let session = body.get("session").and_then(Value::as_str).unwrap_or("");
-      service
-        .context
-        .set_manual_heavy(session, false)
-        .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
     }
     "/v1/run" => {
       let command = body
@@ -80,21 +53,24 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
         .and_then(Value::as_bool)
         .unwrap_or(false);
       let ensure = body.get("ensure").and_then(Value::as_bool).unwrap_or(true);
-      let session = requested_session(&body);
       let heavy = requested_heavy(&body);
       if async_job {
         let jobs = service.jobs.clone();
         let service_for_job = Arc::clone(&service);
-        jobs.submit("run", move || {
-          service_for_job.run_command(
-            command, timeout, rows, cols, raw, no_prelude, ensure, session, heavy,
-          )
-        })
+        if heavy {
+          let queue = service.heavy_queue.clone();
+          jobs.submit_ordered("run", queue, move || {
+            service_for_job.run_command_inner(command, timeout, rows, cols, raw, no_prelude, ensure)
+          })
+        } else {
+          jobs.submit("run", move || {
+            service_for_job
+              .run_command(command, timeout, rows, cols, raw, no_prelude, ensure, false)
+          })
+        }
       } else {
         service
-          .run_command(
-            command, timeout, rows, cols, raw, no_prelude, ensure, session, heavy,
-          )
+          .run_command(command, timeout, rows, cols, raw, no_prelude, ensure, heavy)
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
     }
@@ -120,23 +96,35 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
         .get("chunk_size")
         .and_then(Value::as_u64)
         .unwrap_or(262144) as usize;
-      let session = requested_session(&body);
       let heavy = requested_heavy(&body);
       if async_job {
         let jobs = service.jobs.clone();
         let service_for_job = Arc::clone(&service);
-        jobs.submit("upload", move || {
-          service_for_job.upload(
-            destination,
-            content_b64,
-            mode,
-            is_archive,
-            timeout,
-            chunk_size,
-            session,
-            heavy,
-          )
-        })
+        if heavy {
+          let queue = service.heavy_queue.clone();
+          jobs.submit_ordered("upload", queue, move || {
+            service_for_job.upload_inner(
+              destination,
+              content_b64,
+              mode,
+              is_archive,
+              timeout,
+              chunk_size,
+            )
+          })
+        } else {
+          jobs.submit("upload", move || {
+            service_for_job.upload(
+              destination,
+              content_b64,
+              mode,
+              is_archive,
+              timeout,
+              chunk_size,
+              false,
+            )
+          })
+        }
       } else {
         service
           .upload(
@@ -146,9 +134,21 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
             is_archive,
             timeout,
             chunk_size,
-            session,
             heavy,
           )
+          .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
+      }
+    }
+    "/v1/resources" => {
+      let timeout =
+        Duration::from_secs_f64(body.get("timeout").and_then(Value::as_f64).unwrap_or(60.0));
+      if async_job {
+        let jobs = service.jobs.clone();
+        let service_for_job = Arc::clone(&service);
+        jobs.submit("resources", move || service_for_job.resources(timeout))
+      } else {
+        service
+          .resources(timeout)
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
     }
@@ -164,33 +164,23 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
         .unwrap_or(false);
       let timeout =
         Duration::from_secs_f64(body.get("timeout").and_then(Value::as_f64).unwrap_or(180.0));
-      let session = requested_session(&body);
       let heavy = requested_heavy(&body);
       if async_job {
         let jobs = service.jobs.clone();
         let service_for_job = Arc::clone(&service);
-        jobs.submit("download", move || {
-          service_for_job.download(source, recursive, timeout, session, heavy)
-        })
+        if heavy {
+          let queue = service.heavy_queue.clone();
+          jobs.submit_ordered("download", queue, move || {
+            service_for_job.download_inner(source, recursive, timeout)
+          })
+        } else {
+          jobs.submit("download", move || {
+            service_for_job.download(source, recursive, timeout, false)
+          })
+        }
       } else {
         service
-          .download(source, recursive, timeout, session, heavy)
-          .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
-      }
-    }
-    "/v1/session/resources" => {
-      let timeout =
-        Duration::from_secs_f64(body.get("timeout").and_then(Value::as_f64).unwrap_or(60.0));
-      let session = requested_session(&body);
-      if async_job {
-        let jobs = service.jobs.clone();
-        let service_for_job = Arc::clone(&service);
-        jobs.submit("session-resources", move || {
-          service_for_job.session_resources(session, timeout)
-        })
-      } else {
-        service
-          .session_resources(session, timeout)
+          .download(source, recursive, timeout, heavy)
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
     }
@@ -200,7 +190,7 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
         body.get("cols").and_then(Value::as_u64),
       );
       service
-        .start_terminal(rows, cols, requested_session(&body), requested_heavy(&body))
+        .start_terminal(rows, cols, requested_heavy(&body))
         .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
     }
     "/v1/terminal/input" => {
@@ -265,12 +255,9 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
             "service": "gjtd",
             "pid": std::process::id(),
             "jobs": service.jobs.stats(),
+            "heavy_queue": service.heavy_queue.status(),
             "stream_url": format!("tcp://{}:{}", service.context.args.stream_host, service.context.args.stream_port),
         }),
-        Method::Get if path == "/v1/sessions" => service
-          .context
-          .sessions_status()
-          .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()})),
         Method::Post => {
           let mut body_text = String::new();
           let read_result = request.as_reader().read_to_string(&mut body_text);

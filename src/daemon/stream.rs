@@ -62,36 +62,29 @@ fn handle_stream(service: Arc<Service>, mut stream: TcpStream) -> Result<()> {
       request.get("rows").and_then(Value::as_u64),
       request.get("cols").and_then(Value::as_u64),
     );
-    let session = request
-      .get("session")
-      .and_then(Value::as_str)
-      .filter(|value| !value.is_empty())
-      .map(ToString::to_string);
     let heavy = request
       .get("heavy")
       .and_then(Value::as_bool)
       .unwrap_or(false);
     log(format!(
-      "stream client connected; opening interactive terminal rows={rows} cols={cols} session={:?} heavy={heavy}",
-      session
+      "stream client connected; opening interactive terminal rows={rows} cols={cols} heavy={heavy}"
     ));
-    let lease = service.acquire_session(session, heavy, Duration::from_secs(24 * 60 * 60))?;
-    let context = service.direct_context(&lease, false)?;
+    let heavy_lease = if heavy {
+      Some(
+        service
+          .heavy_queue
+          .enter_blocking(format!("stream-{}", token_hex(8))),
+      )
+    } else {
+      None
+    };
+    let context = service.direct_context(false)?;
     let href = context.notebook.lab_url.clone();
-    let session_id = lease.session_id.clone();
     let mut terminal = ApiTerminal::new(context.client, context.notebook, rows, cols);
     terminal.start(Duration::from_secs(30))?;
-    log(format!(
-      "stream terminal opened: {href} session={session_id}"
-    ));
+    log(format!("stream terminal opened: {href}"));
     stream.write_all(
-      serde_json::to_string(&json!({
-        "ok": true,
-        "id": token_hex(12),
-        "href": href,
-        "session": session_id,
-      }))?
-      .as_bytes(),
+      serde_json::to_string(&json!({"ok": true, "id": token_hex(12), "href": href}))?.as_bytes(),
     )?;
     stream.write_all(b"\n")?;
     match prepare_stream_prompt(&mut terminal) {
@@ -106,11 +99,14 @@ fn handle_stream(service: Arc<Service>, mut stream: TcpStream) -> Result<()> {
     if !initial_input.is_empty() {
       terminal.send(&String::from_utf8_lossy(&initial_input))?;
     }
-    Ok::<(ApiTerminal, super::session::SessionLease), anyhow::Error>((terminal, lease))
+    Ok::<(ApiTerminal, Option<super::jobs::OrderedQueueLease>), anyhow::Error>((
+      terminal,
+      heavy_lease,
+    ))
   })();
 
-  let (mut terminal, _lease) = match terminal {
-    Ok((terminal, lease)) => (terminal, lease),
+  let (mut terminal, _heavy_lease) = match terminal {
+    Ok(terminal) => terminal,
     Err(err) => {
       let _ = stream.write_all(
         serde_json::to_string(&json!({"ok": false, "error": err.to_string()}))?.as_bytes(),

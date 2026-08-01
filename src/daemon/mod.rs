@@ -1,21 +1,19 @@
 mod args;
 mod http;
 mod jobs;
-mod session;
 mod stream;
 mod terminal;
 
 use crate::config;
 use crate::direct::{self, ApiTerminal, CookieAuth, HttpClient, NotebookInfo};
 use crate::runtime;
-use crate::util::{log, shell_quote, token_hex};
+use crate::util::{log, shell_quote, token_hex, write_json_file};
 use anyhow::{Context, Result, anyhow, bail};
 use args::Args;
 use clap::Parser;
 use http::run_http_server;
-use jobs::JobManager;
+use jobs::{JobManager, OrderedJobQueue};
 use serde_json::{Value, json};
-use session::{NotebookSpec, SessionLease};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -29,7 +27,7 @@ use terminal::{LiveTerminal, drain_api_terminal, wait_api_command_marker};
 
 const DOWNLOAD_BEGIN_MARK: &str = "__GJTD_DOWNLOAD_BEGIN__";
 const DOWNLOAD_END_MARK: &str = "__GJTD_DOWNLOAD_END__";
-const SESSION_RESOURCES_COMMAND: &str = r#"python3 - <<'PY'
+const RESOURCES_COMMAND: &str = r#"python3 - <<'PY'
 import json
 import os
 import pathlib
@@ -48,13 +46,7 @@ def limited(text, limit):
 
 def run(cmd, timeout=8):
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
-        )
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
         return {
             "ok": proc.returncode == 0,
             "returncode": proc.returncode,
@@ -119,12 +111,7 @@ def cpuinfo():
 def disk_usage(path):
     try:
         usage = shutil.disk_usage(path)
-        return {
-            "path": path,
-            "total_bytes": usage.total,
-            "used_bytes": usage.used,
-            "free_bytes": usage.free,
-        }
+        return {"path": path, "total_bytes": usage.total, "used_bytes": usage.used, "free_bytes": usage.free}
     except Exception as exc:
         return {"path": path, "error": str(exc)}
 
@@ -148,8 +135,82 @@ def cann_versions():
     return out
 
 
+def number(value):
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except Exception:
+        return value
+
+
+def parse_npu_smi_info(result):
+    text = result.get("stdout") or ""
+    parsed = {
+        "ok": result.get("ok", False),
+        "returncode": result.get("returncode"),
+        "stderr": result.get("stderr", ""),
+        "devices": [],
+        "processes": [],
+    }
+    if result.get("error"):
+        parsed["error"] = result.get("error")
+    header = re.search(r"npu-smi\s+(\S+)\s+Version:\s+(\S+)", text)
+    if header:
+        parsed["npu_smi_version"] = header.group(1)
+        parsed["driver_version"] = header.group(2)
+
+    first_row = re.compile(r"^\|\s*(\d+)\s+(\S+)\s*\|\s*(\S+)\s*\|\s*([0-9.]+)\s+([0-9.]+)\s+(\d+)\s*/\s*(\d+)\s*\|")
+    second_row = re.compile(r"^\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*([0-9.]+)\s+(\d+)\s*/\s*(\d+)\s+(\d+)\s*/\s*(\d+)\s*\|")
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines) - 1:
+        if "Process id" in lines[index]:
+            break
+        match1 = first_row.match(lines[index])
+        match2 = second_row.match(lines[index + 1]) if match1 else None
+        if match1 and match2:
+            parsed["devices"].append({
+                "npu": int(match1.group(1)),
+                "name": match1.group(2),
+                "health": match1.group(3),
+                "power_w": number(match1.group(4)),
+                "temp_c": number(match1.group(5)),
+                "hugepages": {"used_pages": int(match1.group(6)), "total_pages": int(match1.group(7))},
+                "chip": int(match2.group(1)),
+                "bus_id": match2.group(2).strip(),
+                "aicore_percent": number(match2.group(3)),
+                "memory_mb": {"used": int(match2.group(4)), "total": int(match2.group(5))},
+                "hbm_mb": {"used": int(match2.group(6)), "total": int(match2.group(7))},
+            })
+            index += 2
+            continue
+        index += 1
+
+    process_row = re.compile(r"^\|\s*(\d+)\s+(\d+)\s*\|\s*(\d+)\s*\|\s*([^|]*?)\s*\|\s*(\d+)\s*\|")
+    in_process_table = False
+    for line in lines:
+        if "Process id" in line:
+            in_process_table = True
+            continue
+        if not in_process_table:
+            continue
+        match = process_row.match(line)
+        if match:
+            parsed["processes"].append({
+                "npu": int(match.group(1)),
+                "chip": int(match.group(2)),
+                "pid": int(match.group(3)),
+                "name": match.group(4).strip(),
+                "memory_mb": int(match.group(5)),
+            })
+    if not parsed["devices"] and text:
+        parsed["parse_warning"] = "npu-smi output format was not recognized"
+        parsed["raw_stdout_tail"] = limited(text, 4000)
+    return parsed
+
+
 npu_smi = run(["npu-smi", "info"], timeout=10)
-which_npu_smi = shutil.which("npu-smi")
 selected_env = {
     key: value
     for key, value in os.environ.items()
@@ -163,7 +224,6 @@ selected_env = {
         "NPU_VISIBLE_DEVICES",
     }
 }
-
 workspace_paths = ["/", os.path.expanduser("~"), os.getcwd(), "/workspace"]
 seen_paths = []
 for path in workspace_paths:
@@ -184,8 +244,8 @@ print(json.dumps({
     "memory": meminfo(),
     "disk": [disk_usage(path) for path in seen_paths],
     "npu": {
-        "npu_smi_path": which_npu_smi,
-        "npu_smi_info": npu_smi,
+        "npu_smi_path": shutil.which("npu-smi"),
+        "npu_smi_info": parse_npu_smi_info(npu_smi),
     },
     "cann": {
         "env": selected_env,
@@ -204,7 +264,6 @@ struct DirectContext {
 struct DaemonContext {
   args: Args,
   chrome: Mutex<Option<Child>>,
-  state_lock: Mutex<()>,
 }
 
 impl DaemonContext {
@@ -212,7 +271,6 @@ impl DaemonContext {
     Self {
       args,
       chrome: Mutex::new(None),
-      state_lock: Mutex::new(()),
     }
   }
 
@@ -403,6 +461,42 @@ impl DaemonContext {
     self.extract_auth_from_chrome(headless)
   }
 
+  fn previous_notebook_from_state(&self) -> Option<NotebookInfo> {
+    let path = self.state_file_path();
+    let text = fs::read_to_string(&path).ok()?;
+    let data: Value = serde_json::from_str(&text).ok()?;
+    let notebook_state = if data.get("href").and_then(Value::as_str).is_some() {
+      &data
+    } else {
+      data
+        .get("sessions")
+        .and_then(Value::as_object)
+        .and_then(|sessions| {
+          sessions
+            .values()
+            .find(|entry| entry.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        })?
+    };
+    let href = notebook_state.get("href")?.as_str()?.to_string();
+    if !href.contains("aihub-run.gitcode.com") {
+      return None;
+    }
+    direct::notebook_from_lab_url(
+      &href,
+      notebook_state
+        .get("target_url")
+        .and_then(Value::as_str)
+        .unwrap_or(""),
+      json!({
+          "state_file": path.display().to_string(),
+          "state_time": notebook_state.get("time").cloned().unwrap_or(Value::Null),
+          "status": notebook_state.get("status").cloned().unwrap_or_else(|| json!({})),
+          "notebook_id": notebook_state.get("notebook_id").cloned().unwrap_or(Value::Null),
+      }),
+    )
+    .ok()
+  }
+
   fn direct_probe_output(&self, status: &Value, notebook: &NotebookInfo) -> String {
     let mut pieces = vec![format!("notebook_id={}", notebook.notebook_id)];
     for key in ["connections", "kernels", "started", "last_activity"] {
@@ -463,7 +557,6 @@ impl DaemonContext {
 
   fn direct_context(
     &self,
-    spec: &NotebookSpec,
     timeout: Duration,
     force_auth_extract: bool,
     allow_chrome: bool,
@@ -478,23 +571,15 @@ impl DaemonContext {
       let attempt = (|| {
         let auth = self.get_direct_auth(force_extract_next, allow_chrome, headless)?;
         let client = HttpClient::new(auth, Some(self.auth_cache_path()))?;
-        if !previous_dead
-          && let Some(previous) = self.previous_notebook_from_session_state(&spec.session_id)
-        {
+        if !previous_dead && let Some(previous) = self.previous_notebook_from_state() {
           match self.direct_probe_context(client, previous.clone()) {
             Ok(context) => {
-              log(format!(
-                "reusing previous notebook for session {}: {}",
-                spec.session_id, previous.base_url
-              ));
+              log(format!("reusing previous notebook: {}", previous.base_url));
               return Ok(context);
             }
             Err(err) => {
               previous_dead = true;
-              log(format!(
-                "previous notebook for session {} is not reusable: {err}",
-                spec.session_id
-              ));
+              log(format!("previous notebook is not reusable: {err}"));
             }
           }
         }
@@ -502,12 +587,12 @@ impl DaemonContext {
         let mut client = HttpClient::new(auth, Some(self.auth_cache_path()))?;
         let notebook = direct::insert_notebook(
           &mut client,
-          &spec.repo_url,
-          &spec.ttl,
-          &spec.disk_size,
-          &spec.notebook_path,
-          &spec.scan_file_path,
-          &spec.gitcode_user,
+          &self.args.repo_url,
+          &self.args.ttl,
+          &self.args.disk_size,
+          &self.args.notebook_path,
+          &self.args.scan_file_path,
+          &self.args.gitcode_user,
           Duration::from_secs_f64(self.args.insert_timeout),
         )?;
         if !notebook.provisioning_status.is_empty() && notebook.provisioning_status != "READY" {
@@ -521,29 +606,16 @@ impl DaemonContext {
               .unwrap_or(Value::Null)
           );
         }
-        if let Some(other_session) = self.duplicate_notebook_session(&spec.session_id, &notebook) {
-          bail!(
-            "session {} resolved to the same notebook as existing session {} (notebook_id={} base_url={}); refusing to establish a duplicate session",
-            spec.session_id,
-            other_session,
-            notebook.notebook_id,
-            notebook.base_url,
-          );
-        }
         self.direct_probe_context(client, notebook)
       })();
 
       match attempt {
         Ok(context) => return Ok(context),
         Err(err) => {
-          let err_text = err.to_string();
-          if err_text.contains("duplicate session") {
-            bail!(err_text);
-          }
-          if allow_chrome && !force_extract_next && err_text.contains("auth") {
+          if allow_chrome && !force_extract_next && err.to_string().contains("auth") {
             force_extract_next = true;
           }
-          last_error = err_text;
+          last_error = err.to_string();
         }
       }
       if Instant::now() >= deadline {
@@ -553,7 +625,33 @@ impl DaemonContext {
     }
   }
 
-  fn open_login_window_and_wait(&self, spec: &NotebookSpec, reason: &str) -> Result<bool> {
+  fn write_state(&self, data: Value) -> Result<()> {
+    if self.args.state_file.is_empty() {
+      return Ok(());
+    }
+    write_json_file(&self.state_file_path(), &data)
+  }
+
+  fn record_ok_state(&self, probe: &Value) -> Result<()> {
+    let status = probe.get("status").cloned().unwrap_or_else(|| json!({}));
+    self.write_state(json!({
+        "ok": true,
+        "href": probe.get("href").cloned().unwrap_or(Value::Null),
+        "target_url": probe.get("target_url").cloned().unwrap_or(Value::Null),
+        "notebook_id": probe.get("notebook_id").cloned().unwrap_or(Value::Null),
+        "base_url": probe.get("base_url").cloned().unwrap_or(Value::Null),
+        "status": status,
+        "remote_started": status.get("started").cloned().unwrap_or(Value::Null),
+        "remote_last_activity": status.get("last_activity").cloned().unwrap_or(Value::Null),
+        "target_url_contains": self.args.notebook_target_contains,
+        "page_url_contains": self.args.notebook_page_contains,
+        "profile": config::expand_tilde(&self.args.chrome_user_data_dir).display().to_string(),
+        "probe": probe.get("output").cloned().unwrap_or(Value::Null),
+        "time": direct::now(),
+    }))
+  }
+
+  fn open_login_window_and_wait(&self, reason: &str) -> Result<bool> {
     if self.args.no_login_window {
       bail!("notebook is unavailable and login window is disabled: {reason}");
     }
@@ -569,7 +667,6 @@ impl DaemonContext {
     let mut last_error = String::new();
     while Instant::now() < deadline {
       match self.direct_context(
-        spec,
         Duration::from_secs_f64(self.args.login_probe_interval.max(1.0)),
         true,
         true,
@@ -591,7 +688,7 @@ impl DaemonContext {
               .unwrap_or("")
               .replace('\n', " ; ")
           ));
-          self.record_session_ok_state(spec, &context.probe)?;
+          self.record_ok_state(&context.probe)?;
           return Ok(true);
         }
         Err(err) => last_error = err.to_string(),
@@ -602,61 +699,46 @@ impl DaemonContext {
   }
 
   fn maintain_once(&self) -> Result<bool> {
-    let mut any_ok = false;
-    for session_id in self.configured_session_ids() {
-      let spec = self.session_spec(&session_id)?;
-      match self.direct_context(
-        &spec,
-        Duration::from_secs_f64(self.args.direct_timeout),
-        false,
-        !self.args.no_launch,
-        self.args.headless(),
-        false,
-      ) {
-        Ok(context) => {
-          log(format!(
-            "session {} notebook ok: {} | {}",
-            spec.session_id,
-            context
-              .probe
-              .get("href")
-              .and_then(Value::as_str)
-              .unwrap_or(""),
-            context
-              .probe
-              .get("output")
-              .and_then(Value::as_str)
-              .unwrap_or("")
-              .replace('\n', " ; ")
-          ));
-          self.record_session_ok_state(&spec, &context.probe)?;
-          any_ok = true;
+    match self.direct_context(
+      Duration::from_secs_f64(self.args.direct_timeout),
+      false,
+      !self.args.no_launch,
+      self.args.headless(),
+      false,
+    ) {
+      Ok(context) => {
+        log(format!(
+          "notebook ok: {} | {}",
+          context
+            .probe
+            .get("href")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+          context
+            .probe
+            .get("output")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .replace('\n', " ; ")
+        ));
+        self.record_ok_state(&context.probe)?;
+        Ok(true)
+      }
+      Err(err) => {
+        log(format!("notebook not ready: {err}"));
+        if self.args.status_only {
+          self.write_state(json!({"ok": false, "reason": "status_only", "time": direct::now()}))?;
+          return Ok(false);
         }
-        Err(err) => {
-          log(format!(
-            "session {} notebook not ready: {err}",
-            spec.session_id
-          ));
-          self.record_session_failure(
-            &spec.session_id,
-            if self.args.status_only {
-              "status_only"
-            } else {
-              "direct_probe_failed"
-            },
-          )?;
-          if self.args.status_only {
-            continue;
-          }
-          if !self.args.no_login_window && !self.args.no_launch {
-            any_ok |= self.open_login_window_and_wait(&spec, "direct probe failed")?;
-            continue;
-          }
-          bail!("direct notebook probe failed and browser launch is disabled");
+        self.write_state(
+          json!({"ok": false, "reason": "direct_probe_failed", "time": direct::now()}),
+        )?;
+        if !self.args.no_login_window && !self.args.no_launch {
+          return self.open_login_window_and_wait("direct probe failed");
         }
+        bail!("direct notebook probe failed and browser launch is disabled");
       }
     }
-    Ok(any_ok)
   }
 }
 
@@ -676,6 +758,7 @@ fn parse_json_object_from_stdout(text: &str) -> Result<Value> {
 struct Service {
   context: Arc<DaemonContext>,
   jobs: JobManager,
+  heavy_queue: OrderedJobQueue,
   ensure_lock: Mutex<()>,
   terminals: RwLock<HashMap<String, Arc<LiveTerminal>>>,
 }
@@ -686,82 +769,28 @@ impl Service {
     Self {
       context,
       jobs: JobManager::new(retention),
+      heavy_queue: OrderedJobQueue::new("heavy"),
       ensure_lock: Mutex::new(()),
       terminals: RwLock::new(HashMap::new()),
     }
   }
 
-  fn acquire_session(
-    &self,
-    session: Option<String>,
-    heavy: bool,
-    lease_duration: Duration,
-  ) -> Result<SessionLease> {
-    SessionLease::acquire(Arc::clone(&self.context), session, heavy, lease_duration)
-  }
-
-  fn direct_context_with_options(
-    &self,
-    lease: &SessionLease,
-    timeout: Duration,
-    force_auth_extract: bool,
-    allow_chrome: bool,
-    skip_previous: bool,
-  ) -> Result<DirectContext> {
+  fn direct_context(&self, skip_previous: bool) -> Result<DirectContext> {
     let _guard = self.ensure_lock.lock().unwrap();
-    let spec = self.context.session_spec(&lease.session_id)?;
     let context = self.context.direct_context(
-      &spec,
-      timeout,
-      force_auth_extract,
-      allow_chrome,
-      self.context.args.headless(),
-      skip_previous,
-    )?;
-    self
-      .context
-      .record_session_ok_state(&spec, &context.probe)?;
-    Ok(context)
-  }
-
-  fn direct_context(&self, lease: &SessionLease, skip_previous: bool) -> Result<DirectContext> {
-    self.direct_context_with_options(
-      lease,
       Duration::from_secs_f64(self.context.args.create_timeout),
       false,
       !self.context.args.no_launch,
+      self.context.args.headless(),
       skip_previous,
-    )
-  }
-
-  fn ensure_one(&self, session: Option<String>) -> Result<Value> {
-    let lease = self.acquire_session(
-      session,
-      false,
-      Duration::from_secs_f64(self.context.args.create_timeout + 60.0),
     )?;
-    let context = self.direct_context(&lease, false)?;
-    Ok(json!({
-      "ok": true,
-      "session": lease.session_id,
-      "href": context.notebook.lab_url,
-      "status": context.status,
-    }))
-  }
-
-  fn ensure_session(&self, session: Option<String>) -> Result<Value> {
-    if session.is_some() {
-      return self.ensure_one(session);
-    }
-    let mut sessions = Vec::new();
-    for id in self.context.configured_session_ids() {
-      sessions.push(self.ensure_one(Some(id))?);
-    }
-    Ok(json!({"ok": true, "sessions": sessions}))
+    self.context.record_ok_state(&context.probe)?;
+    Ok(context)
   }
 
   fn ensure(&self) -> Result<Value> {
-    self.ensure_session(None)
+    let context = self.direct_context(false)?;
+    Ok(json!({"ok": true, "href": context.notebook.lab_url, "status": context.status}))
   }
 
   fn run_command(
@@ -773,24 +802,36 @@ impl Service {
     raw: bool,
     no_prelude: bool,
     ensure: bool,
-    session: Option<String>,
     heavy: bool,
   ) -> Result<Value> {
-    let lease = self.acquire_session(
-      session,
-      heavy,
-      Duration::from_secs_f64(timeout.as_secs_f64() + 60.0),
-    )?;
+    if heavy {
+      return self.heavy_queue.run_blocking("run", || {
+        self.run_command_inner(command, timeout, rows, cols, raw, no_prelude, ensure)
+      });
+    }
+    self.run_command_inner(command, timeout, rows, cols, raw, no_prelude, ensure)
+  }
+
+  fn run_command_inner(
+    &self,
+    command: String,
+    timeout: Duration,
+    rows: u16,
+    cols: u16,
+    raw: bool,
+    no_prelude: bool,
+    ensure: bool,
+  ) -> Result<Value> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
       let context = if ensure {
-        self.direct_context(&lease, attempt > 0)?
+        self.direct_context(attempt > 0)?
       } else {
-        self.direct_context_with_options(
-          &lease,
+        self.context.direct_context(
           Duration::from_secs_f64(self.context.args.direct_timeout),
           false,
           false,
+          self.context.args.headless(),
           attempt > 0,
         )?
       };
@@ -814,13 +855,9 @@ impl Service {
         .join("\n");
         terminal.send(&wrapped)?;
         let (status, text) = wait_api_command_marker(&mut terminal, &marker, timeout, raw)?;
-        Ok(json!({
-          "ok": status == 0,
-          "exit_code": status,
-          "stdout": text,
-          "href": context.notebook.lab_url,
-          "session": lease.session_id,
-        }))
+        Ok(
+          json!({"ok": status == 0, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}),
+        )
       })() {
         Ok(result) => {
           terminal.close();
@@ -830,10 +867,7 @@ impl Service {
           terminal.close();
           last_error = Some(err);
           if attempt == 0 {
-            log(format!(
-              "remote command failed on session {}; replacing notebook",
-              lease.session_id
-            ));
+            log("remote command failed on current notebook; replacing notebook");
           }
         }
       }
@@ -854,8 +888,38 @@ impl Service {
     is_archive: bool,
     timeout: Duration,
     chunk_size: usize,
-    session: Option<String>,
     heavy: bool,
+  ) -> Result<Value> {
+    if heavy {
+      return self.heavy_queue.run_blocking("upload", || {
+        self.upload_inner(
+          destination,
+          payload_b64,
+          mode,
+          is_archive,
+          timeout,
+          chunk_size,
+        )
+      });
+    }
+    self.upload_inner(
+      destination,
+      payload_b64,
+      mode,
+      is_archive,
+      timeout,
+      chunk_size,
+    )
+  }
+
+  fn upload_inner(
+    &self,
+    destination: String,
+    payload_b64: String,
+    mode: u32,
+    is_archive: bool,
+    timeout: Duration,
+    chunk_size: usize,
   ) -> Result<Value> {
     let marker = format!("__GJTD_UPLOAD_{}__:", token_hex(8));
     let heredoc = format!("__GJTD_UPLOAD_PAYLOAD_{}__", token_hex(8));
@@ -873,14 +937,9 @@ impl Service {
         mode = mode_octal
       )
     };
-    let lease = self.acquire_session(
-      session,
-      heavy,
-      Duration::from_secs_f64(timeout.as_secs_f64() + 60.0),
-    )?;
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
-      let context = self.direct_context(&lease, attempt > 0)?;
+      let context = self.direct_context(attempt > 0)?;
       let mut terminal = ApiTerminal::new(context.client, context.notebook.clone(), 24, 120);
       let result = (|| {
         terminal.start(Duration::from_secs(30))?;
@@ -915,13 +974,9 @@ impl Service {
           .join("\n"),
         )?;
         let (status, text) = wait_api_command_marker(&mut terminal, &marker, timeout, false)?;
-        Ok(json!({
-          "ok": status == 0,
-          "exit_code": status,
-          "stdout": text,
-          "href": context.notebook.lab_url,
-          "session": lease.session_id,
-        }))
+        Ok(
+          json!({"ok": status == 0, "exit_code": status, "stdout": text, "href": context.notebook.lab_url}),
+        )
       })();
       terminal.close();
       match result {
@@ -929,10 +984,7 @@ impl Service {
         Err(err) => {
           last_error = Some(err);
           if attempt == 0 {
-            log(format!(
-              "upload failed on session {}; replacing notebook",
-              lease.session_id
-            ));
+            log("upload failed on current notebook; replacing notebook");
           }
         }
       }
@@ -948,9 +1000,17 @@ impl Service {
     source: String,
     recursive: bool,
     timeout: Duration,
-    session: Option<String>,
     heavy: bool,
   ) -> Result<Value> {
+    if heavy {
+      return self.heavy_queue.run_blocking("download", || {
+        self.download_inner(source, recursive, timeout)
+      });
+    }
+    self.download_inner(source, recursive, timeout)
+  }
+
+  fn download_inner(&self, source: String, recursive: bool, timeout: Duration) -> Result<Value> {
     let source_arg = shell_quote(&source);
     let command = if recursive {
       format!(
@@ -983,9 +1043,7 @@ printf '%s\n' {end}
         end = shell_quote(DOWNLOAD_END_MARK),
       )
     };
-    let result = self.run_command(
-      command, timeout, 24, 120, false, false, true, session, heavy,
-    )?;
+    let result = self.run_command_inner(command, timeout, 24, 120, false, false, true)?;
     if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
       return Ok(result);
     }
@@ -1008,26 +1066,20 @@ printf '%s\n' {end}
     let payload = stdout[begin + DOWNLOAD_BEGIN_MARK.len()..end]
       .split_whitespace()
       .collect::<String>();
-    Ok(json!({
-      "ok": true,
-      "exit_code": 0,
-      "content_b64": payload,
-      "href": result.get("href").cloned().unwrap_or(Value::Null),
-      "session": result.get("session").cloned().unwrap_or(Value::Null),
-    }))
+    Ok(
+      json!({"ok": true, "exit_code": 0, "content_b64": payload, "href": result.get("href").cloned().unwrap_or(Value::Null)}),
+    )
   }
 
-  fn session_resources(&self, session: Option<String>, timeout: Duration) -> Result<Value> {
-    let result = self.run_command(
-      SESSION_RESOURCES_COMMAND.to_string(),
+  fn resources(&self, timeout: Duration) -> Result<Value> {
+    let result = self.run_command_inner(
+      RESOURCES_COMMAND.to_string(),
       timeout,
       40,
       160,
       false,
       false,
       true,
-      session,
-      false,
     )?;
     if !result.get("ok").and_then(Value::as_bool).unwrap_or(false) {
       return Ok(result);
@@ -1036,46 +1088,46 @@ printf '%s\n' {end}
     let resources = parse_json_object_from_stdout(stdout)?;
     Ok(json!({
       "ok": true,
-      "session": result.get("session").cloned().unwrap_or(Value::Null),
       "href": result.get("href").cloned().unwrap_or(Value::Null),
       "resources": resources,
     }))
   }
 
-  fn open_terminal(
-    &self,
-    rows: u16,
-    cols: u16,
-    session: Option<String>,
-    heavy: bool,
-  ) -> Result<Arc<LiveTerminal>> {
-    let lease = self.acquire_session(session, heavy, Duration::from_secs(24 * 60 * 60))?;
-    match LiveTerminal::new(self, lease, rows, cols) {
+  fn open_terminal(&self, rows: u16, cols: u16, heavy: bool) -> Result<Arc<LiveTerminal>> {
+    let heavy_lease = if heavy {
+      Some(
+        self
+          .heavy_queue
+          .enter_blocking(format!("terminal-{}", token_hex(8))),
+      )
+    } else {
+      None
+    };
+    match LiveTerminal::new(self, rows, cols, heavy_lease) {
       Ok(terminal) => Ok(Arc::new(terminal)),
-      Err(err) => Err(err),
+      Err(_) => {
+        let _ = self.ensure();
+        let heavy_lease = if heavy {
+          Some(
+            self
+              .heavy_queue
+              .enter_blocking(format!("terminal-{}", token_hex(8))),
+          )
+        } else {
+          None
+        };
+        Ok(Arc::new(LiveTerminal::new(self, rows, cols, heavy_lease)?))
+      }
     }
   }
 
-  fn start_terminal(
-    &self,
-    rows: u16,
-    cols: u16,
-    session: Option<String>,
-    heavy: bool,
-  ) -> Result<Value> {
-    let terminal = self.open_terminal(rows, cols, session, heavy)?;
+  fn start_terminal(&self, rows: u16, cols: u16, heavy: bool) -> Result<Value> {
+    let terminal = self.open_terminal(rows, cols, heavy)?;
     let initial_output = terminal.prepare_interactive_prompt()?;
     let id = terminal.id.clone();
     let href = terminal.href.clone();
-    let session = terminal.session_id.clone();
     self.terminals.write().unwrap().insert(id.clone(), terminal);
-    Ok(json!({
-      "ok": true,
-      "id": id,
-      "href": href,
-      "session": session,
-      "initial_output": initial_output,
-    }))
+    Ok(json!({"ok": true, "id": id, "href": href, "initial_output": initial_output}))
   }
 
   fn get_terminal(&self, id: &str) -> Result<Arc<LiveTerminal>> {

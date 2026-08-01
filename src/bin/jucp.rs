@@ -43,8 +43,6 @@ struct Args {
   timeout: f64,
   #[arg(long, default_value_t = 262144)]
   chunk_size: usize,
-  #[arg(long)]
-  session: Option<String>,
   #[arg(long, action = ArgAction::SetTrue)]
   heavy: bool,
 }
@@ -145,7 +143,6 @@ fn ensure_daemon(args: &Args) -> Result<()> {
     &args.stream_url,
     true,
     &client::default_log(),
-    None,
     Duration::from_secs_f64(args.daemon_start_timeout),
   )
 }
@@ -189,7 +186,6 @@ fn upload(args: &Args) -> Result<()> {
         "is_archive": is_archive,
         "timeout": args.timeout,
         "chunk_size": args.chunk_size,
-        "session": args.session.clone(),
         "heavy": args.heavy,
     }),
     Duration::from_secs(10),
@@ -228,7 +224,6 @@ fn download(args: &Args) -> Result<()> {
       "source": source,
       "recursive": args.recursive,
       "timeout": args.timeout,
-      "session": args.session.clone(),
       "heavy": args.heavy,
     }),
     Duration::from_secs(10),

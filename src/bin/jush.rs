@@ -51,8 +51,6 @@ struct Args {
   raw: bool,
   #[arg(long, action = ArgAction::SetTrue)]
   no_prelude: bool,
-  #[arg(long)]
-  session: Option<String>,
   #[arg(long, action = ArgAction::SetTrue)]
   heavy: bool,
   #[arg(value_name = "argument")]
@@ -229,7 +227,6 @@ fn ensure_daemon(args: &Args) -> Result<()> {
     &args.stream_url,
     true,
     &client::default_log(),
-    None,
     Duration::from_secs_f64(args.daemon_start_timeout),
   )
 }
@@ -248,7 +245,6 @@ fn run_command(command: String, args: &Args) -> Result<i32> {
         "cols": cols,
         "raw": args.raw,
         "no_prelude": args.no_prelude,
-        "session": args.session.clone(),
         "heavy": args.heavy,
     }),
     Duration::from_secs(10),
@@ -325,13 +321,7 @@ fn interactive(args: &Args) -> Result<i32> {
     Duration::from_secs_f64(args.daemon_start_timeout),
   )?;
   sock.write_all(
-    serde_json::to_string(&json!({
-      "rows": rows,
-      "cols": cols,
-      "session": args.session.clone(),
-      "heavy": args.heavy,
-    }))?
-    .as_bytes(),
+    serde_json::to_string(&json!({"rows": rows, "cols": cols, "heavy": args.heavy}))?.as_bytes(),
   )?;
   sock.write_all(b"\n")?;
   let (start, initial_output) = read_stream_header(

@@ -9,7 +9,7 @@ The project now builds four executables:
 - `gjtd`: GitCode Jupyter Tool daemon. It keeps a usable notebook available and exposes a local HTTP API plus a low-latency TCP stream.
 - `jush`: Jupyter shell client. It runs remote commands, local scripts, stdin scripts, or an interactive shell through `gjtd`.
 - `jucp`: Jupyter copy client. It copies files or directories between local paths and `jupyter:` remote paths.
-- `gjtctl`: daemon control tool for start, stop, restart, and status.
+- `gjtctl`: daemon control tool for start, stop, restart, status, and resource inspection.
 
 ## Configuration
 
@@ -72,12 +72,15 @@ Start the daemon:
 gjtctl start
 ```
 
-Check status:
+Check daemon status and remote resources:
 
 ```bash
 gjtctl status
 gjtctl status --json
+gjtctl resources --timeout 60
 ```
+
+`gjtctl resources` probes the current notebook and returns CPU, memory, NPU, CANN/toolkit, disk, and system details as JSON; `npu-smi info` is parsed into structured device/process fields.
 
 Stop or restart:
 
@@ -126,6 +129,17 @@ jucp -r jupyter:/workspace/notebook1/logs ./logs
 ```
 
 Remote paths must start with `jupyter:`. Exactly one side must be local and exactly one side must be remote.
+
+## Heavy workload queue
+
+Long builds, tests, profiling runs, and large copies can be marked heavy:
+
+```bash
+jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
+jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
+```
+
+Heavy requests are queued by `gjtd` and run one at a time in submission order. Normal non-heavy commands are not blocked by the heavy queue. `gjtctl status` shows the current heavy queue state.
 
 ## Direct daemon use
 

@@ -73,10 +73,6 @@ fn default_state_file() -> String {
   )
 }
 
-fn default_session_experiences() -> String {
-  config::env_string(&["GJTD_SESSION_EXPERIENCES"], "")
-}
-
 #[derive(Clone, Parser)]
 #[command(
   name = "gjtd",
@@ -91,8 +87,6 @@ pub(crate) struct Args {
   pub(crate) hub_context_contains: String,
   #[arg(long, default_value_t = 0)]
   pub(crate) experience_index: usize,
-  #[arg(long, default_value_t = default_session_experiences())]
-  pub(crate) session_experiences: String,
   #[arg(long, default_value_t = default_repo_url())]
   pub(crate) repo_url: String,
   #[arg(long, default_value_t = default_ttl())]

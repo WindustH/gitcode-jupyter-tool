@@ -9,7 +9,7 @@
 - `gjtd`：GitCode Jupyter Tool daemon，负责维护可用 notebook，并暴露本地 HTTP API 和低延迟 TCP stream。
 - `jush`：Jupyter shell 客户端，支持交互式 shell、`-c` 命令、本地脚本、stdin 脚本。
 - `jucp`：Jupyter copy 客户端，支持本地路径和 `jupyter:` 远端路径之间复制文件或目录。
-- `gjtctl`：daemon 控制工具，支持 start、status、stop、restart。
+- `gjtctl`：daemon 控制工具，支持 start、status、stop、restart 和资源探测。
 
 ## 配置目录
 
@@ -72,12 +72,15 @@ target/release/gjtctl
 gjtctl start
 ```
 
-查看状态：
+查看 daemon 状态和远端资源：
 
 ```bash
 gjtctl status
 gjtctl status --json
+gjtctl resources --timeout 60
 ```
+
+`gjtctl resources` 会探测当前 notebook，并以 JSON 输出 CPU、内存、NPU、CANN/toolkit、磁盘和系统信息；其中 `npu-smi info` 会被解析成结构化字段。
 
 停止或重启：
 
@@ -146,6 +149,17 @@ jucp jupyter:result.txt ./result.txt
 jucp -r ./cases jupyter:/workspace/notebook1/cases
 jucp -r jupyter:/workspace/notebook1/logs ./logs
 ```
+
+## Heavy 任务队列
+
+长时间构建、测试、profiling 和大文件复制可以标记为 heavy：
+
+```bash
+jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
+jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
+```
+
+`gjtd` 会把 heavy 请求放进队列，并按提交顺序一次只执行一个。普通非 heavy 命令不会被 heavy 队列阻塞。`gjtctl status` 会显示当前 heavy 队列状态。
 
 ## 直接运行 daemon
 

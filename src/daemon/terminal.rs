@@ -1,5 +1,5 @@
 use super::Service;
-use super::session::SessionLease;
+use super::jobs::OrderedQueueLease;
 use crate::direct::ApiTerminal;
 use crate::util::{log, shell_quote, strip_terminal_noise, token_hex};
 use anyhow::{Result, anyhow};
@@ -14,24 +14,27 @@ const INTERACTIVE_PS1: &str = r"\[\033[1;36m\]\w\[\033[0m\] \[\033[1;32m\]\$\[\0
 pub(super) struct LiveTerminal {
   pub(super) id: String,
   pub(super) href: String,
-  pub(super) session_id: String,
   terminal: Arc<Mutex<ApiTerminal>>,
   output: Arc<(Mutex<VecDeque<String>>, Condvar)>,
   closed: Arc<AtomicBool>,
-  _lease: SessionLease,
+  _heavy_lease: Option<OrderedQueueLease>,
 }
 
 impl LiveTerminal {
-  pub(super) fn new(service: &Service, lease: SessionLease, rows: u16, cols: u16) -> Result<Self> {
+  pub(super) fn new(
+    service: &Service,
+    rows: u16,
+    cols: u16,
+    heavy_lease: Option<OrderedQueueLease>,
+  ) -> Result<Self> {
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
-      let context = service.direct_context(&lease, attempt > 0)?;
+      let context = service.direct_context(attempt > 0)?;
       let mut terminal = ApiTerminal::new(context.client, context.notebook.clone(), rows, cols);
       match terminal.start(Duration::from_secs(30)) {
         Ok(_) => {
           let id = token_hex(12);
           let href = context.notebook.lab_url;
-          let session_id = lease.session_id.clone();
           let terminal = Arc::new(Mutex::new(terminal));
           let output = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
           let closed = Arc::new(AtomicBool::new(false));
@@ -43,20 +46,16 @@ impl LiveTerminal {
           return Ok(Self {
             id,
             href,
-            session_id,
             terminal,
             output,
             closed,
-            _lease: lease,
+            _heavy_lease: heavy_lease,
           });
         }
         Err(err) => {
           last_error = Some(err);
           if attempt == 0 {
-            log(format!(
-              "interactive terminal failed on session {}; replacing notebook",
-              lease.session_id
-            ));
+            log("interactive terminal failed on current notebook; replacing notebook");
           }
         }
       }

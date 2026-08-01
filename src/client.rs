@@ -25,22 +25,20 @@ pub fn request(api_url: &str, path: &str, payload: Value, timeout: Duration) -> 
     .with_context(|| format!("parse JSON response from {url}"))
 }
 
-pub fn health(api_url: &str) -> bool {
+pub fn health_payload(api_url: &str) -> Option<Value> {
   let url = format!("{}/v1/health", api_url.trim_end_matches('/'));
-  let Ok(client) = Client::builder()
+  let client = Client::builder()
     .no_proxy()
     .timeout(Duration::from_secs(2))
     .build()
-  else {
-    return false;
-  };
-  let Ok(response) = client.get(url).send() else {
-    return false;
-  };
-  let Ok(payload) = response.json::<Value>() else {
-    return false;
-  };
-  payload.get("ok").and_then(Value::as_bool).unwrap_or(false)
+    .ok()?;
+  client.get(url).send().ok()?.json::<Value>().ok()
+}
+
+pub fn health(api_url: &str) -> bool {
+  health_payload(api_url)
+    .and_then(|payload| payload.get("ok").and_then(Value::as_bool))
+    .unwrap_or(false)
 }
 
 pub fn wait_job_result(
@@ -144,7 +142,6 @@ pub fn start_daemon(
   stream_url: &str,
   headless: bool,
   log_path: &str,
-  session_experiences: Option<&str>,
   timeout: Duration,
 ) -> Result<()> {
   if health(api_url) {
@@ -176,11 +173,6 @@ pub fn start_daemon(
     .arg(stream_port.to_string())
     .stdout(Stdio::from(log))
     .stderr(Stdio::from(log_err));
-  if let Some(session_experiences) = session_experiences.filter(|value| !value.is_empty()) {
-    command
-      .arg("--session-experiences")
-      .arg(session_experiences);
-  }
   if headless {
     command.arg("--headless");
   } else {
@@ -214,21 +206,13 @@ pub fn ensure_daemon(
   stream_url: &str,
   headless: bool,
   log_path: &str,
-  session_experiences: Option<&str>,
   timeout: Duration,
 ) -> Result<()> {
   if health(api_url) {
     return Ok(());
   }
   if auto_start {
-    start_daemon(
-      api_url,
-      stream_url,
-      headless,
-      log_path,
-      session_experiences,
-      timeout,
-    )
+    start_daemon(api_url, stream_url, headless, log_path, timeout)
   } else {
     bail!("gjtd is not running at {api_url}; start it with gjtctl start")
   }

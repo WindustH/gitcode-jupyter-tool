@@ -20,7 +20,7 @@ enum CommandKind {
   Start(CommonArgs),
   Stop(StopArgs),
   Restart(StopArgs),
-  Session(SessionArgs),
+  Resources(CommonArgs),
 }
 
 #[derive(Clone, ClapArgs)]
@@ -37,8 +37,6 @@ struct CommonArgs {
   headless: bool,
   #[arg(long, action = clap::ArgAction::SetTrue)]
   visible: bool,
-  #[arg(long)]
-  session_experiences: Option<String>,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -55,36 +53,6 @@ struct StopArgs {
   common: CommonArgs,
   #[arg(long, action = clap::ArgAction::SetTrue)]
   force: bool,
-}
-
-#[derive(Clone, ClapArgs)]
-struct SessionArgs {
-  #[command(subcommand)]
-  command: SessionCommand,
-}
-
-#[derive(Clone, Subcommand)]
-enum SessionCommand {
-  List(SessionListArgs),
-  Ensure(SessionTargetArgs),
-  Resources(SessionTargetArgs),
-  MarkHeavy(SessionTargetArgs),
-  UnmarkHeavy(SessionTargetArgs),
-}
-
-#[derive(Clone, ClapArgs)]
-struct SessionListArgs {
-  #[command(flatten)]
-  common: CommonArgs,
-  #[arg(long, action = clap::ArgAction::SetTrue)]
-  json: bool,
-}
-
-#[derive(Clone, ClapArgs)]
-struct SessionTargetArgs {
-  #[command(flatten)]
-  common: CommonArgs,
-  session: String,
 }
 
 impl CommonArgs {
@@ -270,19 +238,13 @@ fn stop_processes(timeout: Duration, force: bool) -> i32 {
 }
 
 fn command_status(args: &StatusArgs) -> i32 {
-  let health_ok = client::health(&args.common.daemon_url);
+  let health = client::health_payload(&args.common.daemon_url);
+  let health_ok = health
+    .as_ref()
+    .and_then(|payload| payload.get("ok"))
+    .and_then(Value::as_bool)
+    .unwrap_or(false);
   let processes = daemon_processes();
-  let sessions = if health_ok {
-    client::request(
-      &args.common.daemon_url,
-      "/v1/sessions",
-      json!({}),
-      Duration::from_secs(2),
-    )
-    .ok()
-  } else {
-    None
-  };
   if args.json {
     println!(
       "{}",
@@ -290,8 +252,8 @@ fn command_status(args: &StatusArgs) -> i32 {
         "ok": health_ok,
         "api_url": args.common.daemon_url,
         "stream_url": args.common.stream_url,
+        "health": health,
         "processes": processes.iter().map(|(pid, cmdline)| json!({"pid": pid, "cmdline": cmdline})).collect::<Vec<_>>(),
-        "sessions": sessions,
       }))
       .unwrap()
     );
@@ -303,14 +265,23 @@ fn command_status(args: &StatusArgs) -> i32 {
   }
   if health_ok {
     println!("gjtd API is running at {}", args.common.daemon_url);
+    if let Some(queue) = health
+      .as_ref()
+      .and_then(|payload| payload.get("heavy_queue"))
+    {
+      let running = queue.get("running").and_then(Value::as_str).unwrap_or("");
+      let queued = queue.get("queued").and_then(Value::as_u64).unwrap_or(0);
+      println!(
+        "heavy queue: running={} queued={}",
+        if running.is_empty() { "none" } else { running },
+        queued
+      );
+    }
   } else {
     println!("gjtd API is not reachable at {}", args.common.daemon_url);
   }
   for (pid, cmdline) in &processes {
     println!("pid {pid}: {}", cmdline.join(" "));
-  }
-  if let Some(sessions) = &sessions {
-    print_sessions(sessions);
   }
   if health_ok || !processes.is_empty() {
     0
@@ -325,7 +296,6 @@ fn command_start(args: &CommonArgs) -> i32 {
     &args.stream_url,
     args.headless(),
     &args.daemon_log,
-    args.session_experiences.as_deref(),
     Duration::from_secs_f64(args.timeout),
   ) {
     Ok(_) => {
@@ -339,76 +309,19 @@ fn command_start(args: &CommonArgs) -> i32 {
   }
 }
 
-fn print_sessions(payload: &Value) {
-  let sessions = payload
-    .get("sessions")
-    .and_then(Value::as_array)
-    .cloned()
-    .unwrap_or_default();
-  if sessions.is_empty() {
-    println!("no sessions reported");
-    return;
-  }
-  for session in sessions {
-    let id = session.get("id").and_then(Value::as_str).unwrap_or("?");
-    let ok = session.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    let heavy = session
-      .get("heavy")
-      .and_then(Value::as_bool)
-      .unwrap_or(false);
-    let href = session.get("href").and_then(Value::as_str).unwrap_or("");
-    println!(
-      "session {id}: ok={} heavy={}{}",
-      ok,
-      heavy,
-      if href.is_empty() {
-        String::new()
-      } else {
-        format!(" href={href}")
-      }
-    );
-  }
-}
-
-fn command_session_list(args: &SessionListArgs) -> i32 {
+fn command_resources(args: &CommonArgs) -> i32 {
   match client::request(
-    &args.common.daemon_url,
-    "/v1/sessions",
-    json!({}),
-    Duration::from_secs_f64(args.common.timeout),
-  ) {
-    Ok(payload) => {
-      if args.json {
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-      } else {
-        print_sessions(&payload);
-      }
-      if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        0
-      } else {
-        1
-      }
-    }
-    Err(err) => {
-      eprintln!("gjtctl: {err:#}");
-      1
-    }
-  }
-}
-
-fn command_session_ensure(args: &SessionTargetArgs) -> i32 {
-  match client::request(
-    &args.common.daemon_url,
-    "/v1/session/ensure",
-    json!({"session": args.session.clone(), "async": true}),
+    &args.daemon_url,
+    "/v1/resources",
+    json!({"timeout": args.timeout, "async": true}),
     Duration::from_secs(10),
   ) {
     Ok(mut payload) => {
       if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
         match client::wait_job_result(
-          &args.common.daemon_url,
+          &args.daemon_url,
           job_id,
-          Duration::from_secs_f64(args.common.timeout + 30.0),
+          Duration::from_secs_f64(args.timeout + 30.0),
           Duration::from_millis(100),
         ) {
           Ok(result) => payload = result,
@@ -427,7 +340,7 @@ fn command_session_ensure(args: &SessionTargetArgs) -> i32 {
           payload
             .get("error")
             .and_then(Value::as_str)
-            .unwrap_or("session ensure failed")
+            .unwrap_or("resource query failed")
         );
         1
       }
@@ -436,88 +349,6 @@ fn command_session_ensure(args: &SessionTargetArgs) -> i32 {
       eprintln!("gjtctl: {err:#}");
       1
     }
-  }
-}
-
-fn command_session_resources(args: &SessionTargetArgs) -> i32 {
-  match client::request(
-    &args.common.daemon_url,
-    "/v1/session/resources",
-    json!({"session": args.session.clone(), "timeout": args.common.timeout, "async": true}),
-    Duration::from_secs(10),
-  ) {
-    Ok(mut payload) => {
-      if let Some(job_id) = payload.get("job_id").and_then(Value::as_str) {
-        match client::wait_job_result(
-          &args.common.daemon_url,
-          job_id,
-          Duration::from_secs_f64(args.common.timeout + 30.0),
-          Duration::from_millis(100),
-        ) {
-          Ok(result) => payload = result,
-          Err(err) => {
-            eprintln!("gjtctl: {err:#}");
-            return 1;
-          }
-        }
-      }
-      if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-        0
-      } else {
-        eprintln!(
-          "gjtctl: {}",
-          payload
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("session resource query failed")
-        );
-        1
-      }
-    }
-    Err(err) => {
-      eprintln!("gjtctl: {err:#}");
-      1
-    }
-  }
-}
-
-fn command_session_request(args: &SessionTargetArgs, path: &str) -> i32 {
-  match client::request(
-    &args.common.daemon_url,
-    path,
-    json!({"session": args.session.clone()}),
-    Duration::from_secs_f64(args.common.timeout),
-  ) {
-    Ok(payload) => {
-      if payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
-        0
-      } else {
-        eprintln!(
-          "gjtctl: {}",
-          payload
-            .get("error")
-            .and_then(Value::as_str)
-            .unwrap_or("session request failed")
-        );
-        1
-      }
-    }
-    Err(err) => {
-      eprintln!("gjtctl: {err:#}");
-      1
-    }
-  }
-}
-
-fn command_session(args: &SessionArgs) -> i32 {
-  match &args.command {
-    SessionCommand::List(args) => command_session_list(args),
-    SessionCommand::Ensure(args) => command_session_ensure(args),
-    SessionCommand::Resources(args) => command_session_resources(args),
-    SessionCommand::MarkHeavy(args) => command_session_request(args, "/v1/session/mark-heavy"),
-    SessionCommand::UnmarkHeavy(args) => command_session_request(args, "/v1/session/unmark-heavy"),
   }
 }
 
@@ -536,7 +367,6 @@ fn run(cli: Cli) -> Result<i32> {
     CommandKind::Status(args) => command_status(&args),
     CommandKind::Start(args) => command_start(&args),
     CommandKind::Stop(args) => command_stop(&args),
-    CommandKind::Session(args) => command_session(&args),
     CommandKind::Restart(args) => {
       let stop = command_stop(&args);
       if stop != 0 {
@@ -545,6 +375,7 @@ fn run(cli: Cli) -> Result<i32> {
         command_start(&args.common)
       }
     }
+    CommandKind::Resources(args) => command_resources(&args),
   })
 }
 
