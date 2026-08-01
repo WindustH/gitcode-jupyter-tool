@@ -237,7 +237,7 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
   let server = Server::http(format!("{}:{}", args.listen_host, args.listen_port))
     .map_err(|err| anyhow!("start HTTP server: {err}"))?;
   crate::util::log(format!(
-    "gjtd API listening on http://{}:{}",
+    "jud API listening on http://{}:{}",
     args.listen_host, args.listen_port
   ));
   while !stop.load(Ordering::Relaxed) {
@@ -252,7 +252,7 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
       let response = match method {
         Method::Get if path == "/" || path == "/v1/health" => json!({
             "ok": true,
-            "service": "gjtd",
+            "service": "jud",
             "pid": std::process::id(),
             "jobs": service.jobs.stats(),
             "heavy_queue": service.heavy_queue.status(),

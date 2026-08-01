@@ -6,10 +6,10 @@
 
 项目会输出四个可执行文件：
 
-- `gjtd`：GitCode Jupyter Tool daemon，负责维护可用 notebook，并暴露本地 HTTP API 和低延迟 TCP stream。
+- `jud`：GitCode Jupyter Tool daemon，负责维护可用 notebook，并暴露本地 HTTP API 和低延迟 TCP stream。
 - `jush`：Jupyter shell 客户端，支持交互式 shell、`-c` 命令、本地脚本、stdin 脚本。
 - `jucp`：Jupyter copy 客户端，支持本地路径和 `jupyter:` 远端路径之间复制文件或目录。
-- `gjtctl`：daemon 控制工具，支持 start、status、stop、restart 和资源探测。
+- `juctl`：daemon 控制工具，支持 login、logout、start、status、stop、restart 和资源探测。
 
 ## 配置目录
 
@@ -28,15 +28,15 @@ ${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 默认本地端口：
 
 ```bash
-GJTD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
-GJTD_API_URL=http://127.0.0.1:18787
-GJTD_STREAM_URL=tcp://127.0.0.1:18788
-GJTD_LOG=/tmp/gjtd.log
-GJTD_CDP_PORT=9222
+JUD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
+JUD_API_URL=http://127.0.0.1:18787
+JUD_STREAM_URL=tcp://127.0.0.1:18788
+JUD_LOG=/tmp/jud.log
+JUD_CDP_PORT=9222
 JUPYTER_CWD=~
 ```
 
-为了兼容旧调用，原来的 `JUPYTERD_*` 环境变量名仍然会被读取。
+为了兼容旧调用，原来的 `GJTD_*` 和 `JUPYTERD_*` 环境变量名仍然会被读取。
 
 ## 构建
 
@@ -47,10 +47,10 @@ cargo build --release
 输出文件：
 
 ```bash
-target/release/gjtd
+target/release/jud
 target/release/jush
 target/release/jucp
-target/release/gjtctl
+target/release/juctl
 ```
 
 ## 使用要求
@@ -58,35 +58,44 @@ target/release/gjtctl
 - Linux 环境。
 - 已安装 Google Chrome 或兼容的 Chrome 浏览器；默认命令是 `google-chrome-stable`，也可以用环境变量 `CHROME` 指定。
 - 能访问 `https://gitcode.com/cann/cann-learning-hub`。
-- 有可登录 GitCode 的账号。首次使用时，如果专用 profile 未登录，`gjtd` 会打开可见 Chrome 窗口让你登录。
+- 有可登录 GitCode 的账号。首次使用时，如果专用 profile 未登录，`jud` 会打开可见 Chrome 窗口让你登录。
 - 默认需要以下本地端口可用：
-  - `127.0.0.1:18787`：`gjtd` HTTP API
+  - `127.0.0.1:18787`：`jud` HTTP API
   - `127.0.0.1:18788`：交互式 shell TCP stream
   - `127.0.0.1:9222`：Chrome DevTools
 
 ## 快速开始
 
+登录或清理专用 GitCode 登录状态：
+
+```bash
+juctl login
+juctl logout
+```
+
+`juctl login` 会打开可见 Chrome，等待你完成 GitCode 登录，缓存 auth；如果 `jud` 原本在运行，登录成功后会自动重启。`juctl logout` 会停止 `jud`，删除 auth cache、notebook state 和专用 Chrome profile；如果想保留 Chrome profile，可用 `juctl logout --keep-profile`。
+
 启动 daemon：
 
 ```bash
-gjtctl start
+juctl start
 ```
 
 查看 daemon 状态和远端资源：
 
 ```bash
-gjtctl status
-gjtctl status --json
-gjtctl resources --timeout 60
+juctl status
+juctl status --json
+juctl resources --timeout 60
 ```
 
-`gjtctl resources` 会探测当前 notebook，并以 JSON 输出 CPU、内存、NPU、CANN/toolkit、磁盘和系统信息；其中 `npu-smi info` 会被解析成结构化字段。
+`juctl resources` 会探测当前 notebook，并以 JSON 输出 CPU、内存、NPU、CANN/toolkit、磁盘和系统信息；其中 `npu-smi info` 会被解析成结构化字段。
 
 停止或重启：
 
 ```bash
-gjtctl stop
-gjtctl restart
+juctl stop
+juctl restart
 ```
 
 进入交互式 shell：
@@ -159,32 +168,32 @@ jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh &&
 jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
 ```
 
-`gjtd` 会把 heavy 请求放进队列，并按提交顺序一次只执行一个。普通非 heavy 命令不会被 heavy 队列阻塞。`gjtctl status` 会显示当前 heavy 队列状态。
+`jud` 会把 heavy 请求放进队列，并按提交顺序一次只执行一个。普通非 heavy 命令不会被 heavy 队列阻塞。`juctl status` 会显示当前 heavy 队列状态。
 
 ## 直接运行 daemon
 
 运行一次维护：
 
 ```bash
-gjtd --once
+jud --once
 ```
 
 只检查状态：
 
 ```bash
-gjtd --status-only
+jud --status-only
 ```
 
 前台运行 daemon：
 
 ```bash
-gjtd --interval 60
+jud --interval 60
 ```
 
-默认 headless 运行。如果专用 profile 没登录，`gjtd` 会临时打开可见 Chrome 登录窗口。强制可见窗口：
+默认 headless 运行。如果专用 profile 没登录，`jud` 会临时打开可见 Chrome 登录窗口。也可以用 `juctl login` 强制刷新登录。强制可见窗口：
 
 ```bash
-gjtd --visible
+jud --visible
 ```
 
-不要把本地 `gjtd` API 暴露到不可信网络。
+不要把本地 `jud` API 暴露到不可信网络。

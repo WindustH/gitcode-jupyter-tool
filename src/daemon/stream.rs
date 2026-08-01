@@ -16,7 +16,7 @@ pub(super) fn run_stream_server(service: Arc<Service>, stop: Arc<AtomicBool>) ->
   let listener = TcpListener::bind(format!("{}:{}", args.stream_host, args.stream_port))?;
   listener.set_nonblocking(true)?;
   log(format!(
-    "gjtd terminal stream listening on tcp://{}:{}",
+    "jud terminal stream listening on tcp://{}:{}",
     args.stream_host, args.stream_port
   ));
   while !stop.load(Ordering::Relaxed) {
@@ -93,7 +93,7 @@ fn handle_stream(service: Arc<Service>, mut stream: TcpStream) -> Result<()> {
       }
       Ok(_) => {}
       Err(err) => {
-        let _ = stream.write_all(format!("\n[gjtd: failed to prepare prompt: {err}]\n").as_bytes());
+        let _ = stream.write_all(format!("\n[jud: failed to prepare prompt: {err}]\n").as_bytes());
       }
     }
     if !initial_input.is_empty() {

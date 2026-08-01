@@ -85,7 +85,7 @@ impl LiveTerminal {
           Err(err) => {
             let (lock, condvar) = &*output;
             let mut queue = lock.lock().unwrap();
-            queue.push_back(format!("\n[gjtd terminal pump failed: {err}]\n"));
+            queue.push_back(format!("\n[jud terminal pump failed: {err}]\n"));
             condvar.notify_all();
             closed.store(true, Ordering::Relaxed);
           }
@@ -122,7 +122,7 @@ impl LiveTerminal {
     let _ = self.read(Duration::from_millis(200));
     self.input("stty -echo 2>/dev/null || true\n")?;
     let _ = self.read(Duration::from_millis(200));
-    let marker = format!("__GJTD_PROMPT_READY_{}__", token_hex(8));
+    let marker = format!("__JUD_PROMPT_READY_{}__", token_hex(8));
     let prelude = [
       "bind 'set enable-bracketed-paste off' 2>/dev/null || true".to_string(),
       "alias ll='ls -l --color=auto'".to_string(),
@@ -252,7 +252,7 @@ pub(in crate::daemon) fn prepare_stream_prompt(terminal: &mut ApiTerminal) -> Re
   terminal.send("stty -echo 2>/dev/null || true\n")?;
   let _ = read_stream_terminal_for(terminal, Duration::from_millis(200));
 
-  let marker = format!("__GJTD_PROMPT_READY_{}__", token_hex(8));
+  let marker = format!("__JUD_PROMPT_READY_{}__", token_hex(8));
   let prelude = [
     "bind 'set enable-bracketed-paste off' 2>/dev/null || true".to_string(),
     "alias ll='ls -l --color=auto'".to_string(),

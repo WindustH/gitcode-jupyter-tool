@@ -9,8 +9,8 @@ name = "gitcode_jupyter_tool"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gjtd"
-path = "src/bin/gjtd.rs"
+name = "jud"
+path = "src/bin/jud.rs"
 
 [[bin]]
 name = "jush"
@@ -21,8 +21,8 @@ name = "jucp"
 path = "src/bin/jucp.rs"
 
 [[bin]]
-name = "gjtctl"
-path = "src/bin/gjtctl.rs"
+name = "juctl"
+path = "src/bin/juctl.rs"
 
 [dependencies]
 anyhow = "1"

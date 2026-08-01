@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use stream::run_stream_server;
 use terminal::{LiveTerminal, drain_api_terminal, wait_api_command_marker};
 
-const DOWNLOAD_BEGIN_MARK: &str = "__GJTD_DOWNLOAD_BEGIN__";
-const DOWNLOAD_END_MARK: &str = "__GJTD_DOWNLOAD_END__";
+const DOWNLOAD_BEGIN_MARK: &str = "__JUD_DOWNLOAD_BEGIN__";
+const DOWNLOAD_END_MARK: &str = "__JUD_DOWNLOAD_END__";
 const RESOURCES_COMMAND: &str = r#"python3 - <<'PY'
 import json
 import os
@@ -661,7 +661,7 @@ impl DaemonContext {
     self.stop_chrome();
     self.ensure_cdp(false)?;
     log(
-      "GitCode login may be required. Complete login in the visible Chrome window; gjtd will keep polling.",
+      "GitCode login may be required. Complete login in the visible Chrome window; jud will keep polling.",
     );
     let deadline = Instant::now() + Duration::from_secs_f64(self.args.login_timeout);
     let mut last_error = String::new();
@@ -696,6 +696,34 @@ impl DaemonContext {
       thread::sleep(Duration::from_secs_f64(self.args.login_probe_interval));
     }
     bail!("visible login window was opened, but notebook is still unavailable: {last_error}")
+  }
+
+  fn login_once(&self) -> Result<bool> {
+    self.stop_chrome();
+    log("opening visible Chrome for GitCode login; complete login in the browser if prompted");
+    let context = self.direct_context(
+      Duration::from_secs_f64(self.args.login_timeout),
+      true,
+      true,
+      false,
+      false,
+    )?;
+    log(format!(
+      "login ok; notebook reachable: {} | {}",
+      context
+        .probe
+        .get("href")
+        .and_then(Value::as_str)
+        .unwrap_or(""),
+      context
+        .probe
+        .get("output")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .replace('\n', " ; ")
+    ));
+    self.record_ok_state(&context.probe)?;
+    Ok(true)
   }
 
   fn maintain_once(&self) -> Result<bool> {
@@ -836,7 +864,7 @@ impl Service {
         )?
       };
       let mut terminal = ApiTerminal::new(context.client, context.notebook.clone(), rows, cols);
-      let marker = format!("__GJTD_RUN_{}__:", token_hex(8));
+      let marker = format!("__JUD_RUN_{}__:", token_hex(8));
       match (|| {
         terminal.start(Duration::from_secs(30))?;
         drain_api_terminal(&mut terminal, Duration::from_millis(500))?;
@@ -848,8 +876,8 @@ impl Service {
           "(".to_string(),
           command.clone(),
           ")".to_string(),
-          "__gjtd_run_status=$?".to_string(),
-          format!("printf '{}%s\\n' \"$__gjtd_run_status\"", marker),
+          "__jud_run_status=$?".to_string(),
+          format!("printf '{}%s\\n' \"$__jud_run_status\"", marker),
           String::new(),
         ]
         .join("\n");
@@ -921,8 +949,8 @@ impl Service {
     timeout: Duration,
     chunk_size: usize,
   ) -> Result<Value> {
-    let marker = format!("__GJTD_UPLOAD_{}__:", token_hex(8));
-    let heredoc = format!("__GJTD_UPLOAD_PAYLOAD_{}__", token_hex(8));
+    let marker = format!("__JUD_UPLOAD_{}__:", token_hex(8));
+    let heredoc = format!("__JUD_UPLOAD_PAYLOAD_{}__", token_hex(8));
     let destination_arg = shell_quote(&destination);
     let mode_octal = format!("{mode:o}");
     let remote_decode = if is_archive {
@@ -949,9 +977,9 @@ impl Service {
         terminal.send(
           &[
             "set +e".to_string(),
-            "tmp_b64=$(mktemp /tmp/gjtd-upload.XXXXXX.b64)".to_string(),
-            "cleanup_gjtd_upload() { rm -f \"$tmp_b64\"; }".to_string(),
-            "trap cleanup_gjtd_upload EXIT".to_string(),
+            "tmp_b64=$(mktemp /tmp/jud-upload.XXXXXX.b64)".to_string(),
+            "cleanup_jud_upload() { rm -f \"$tmp_b64\"; }".to_string(),
+            "trap cleanup_jud_upload EXIT".to_string(),
             format!("cat > \"$tmp_b64\" <<'{heredoc}'"),
             String::new(),
           ]
@@ -967,8 +995,8 @@ impl Service {
           &[
             heredoc.clone(),
             remote_decode.clone(),
-            "__gjtd_upload_status=$?".to_string(),
-            format!("printf '{}%s\\n' \"$__gjtd_upload_status\"", marker),
+            "__jud_upload_status=$?".to_string(),
+            format!("printf '{}%s\\n' \"$__jud_upload_status\"", marker),
             String::new(),
           ]
           .join("\n"),
@@ -1196,9 +1224,17 @@ fn run_server(context: Arc<DaemonContext>) -> Result<i32> {
 pub fn run_cli() {
   let args = Args::parse();
   let context = Arc::new(DaemonContext::new(args.clone()));
-  let code = if !args.once && !args.status_only {
+  let code = if args.login {
+    match context.login_once() {
+      Ok(_) => 0,
+      Err(err) => {
+        log(format!("login failed: {err}"));
+        1
+      }
+    }
+  } else if !args.once && !args.status_only {
     run_server(context).unwrap_or_else(|err| {
-      eprintln!("gjtd: {err:#}");
+      eprintln!("jud: {err:#}");
       1
     })
   } else {

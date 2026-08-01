@@ -19,7 +19,7 @@ pub fn request(api_url: &str, path: &str, payload: Value, timeout: Duration) -> 
     .header(reqwest::header::ACCEPT, "application/json")
     .body(serde_json::to_vec(&payload)?)
     .send()
-    .with_context(|| format!("gjtd request failed for {url}"))?;
+    .with_context(|| format!("jud request failed for {url}"))?;
   response
     .json()
     .with_context(|| format!("parse JSON response from {url}"))
@@ -61,7 +61,7 @@ pub fn wait_job_result(
         payload
           .get("error")
           .and_then(Value::as_str)
-          .unwrap_or("gjtd job query failed")
+          .unwrap_or("jud job query failed")
       );
     }
     let job = payload.get("job").cloned().unwrap_or_else(|| json!({}));
@@ -77,14 +77,14 @@ pub fn wait_job_result(
       Some("failed") => {
         return Ok(json!({
             "ok": false,
-            "error": job.get("error").and_then(Value::as_str).unwrap_or("gjtd job failed"),
+            "error": job.get("error").and_then(Value::as_str).unwrap_or("jud job failed"),
         }));
       }
       _ => thread::sleep(poll_interval),
     }
   }
   Ok(
-    json!({"ok": false, "error": format!("gjtd job {job_id} timed out after {:.1}s", timeout.as_secs_f64()), "exit_code": 124}),
+    json!({"ok": false, "error": format!("jud job {job_id} timed out after {:.1}s", timeout.as_secs_f64()), "exit_code": 124}),
   )
 }
 
@@ -118,23 +118,26 @@ pub fn connect_tcp(url: &str, timeout: Duration) -> Result<TcpStream> {
 }
 
 pub fn default_api_url() -> String {
-  crate::config::env_string(&["GJTD_API_URL", "JUPYTERD_API_URL"], DEFAULT_API_URL)
+  crate::config::env_string(
+    &["JUD_API_URL", "GJTD_API_URL", "JUPYTERD_API_URL"],
+    DEFAULT_API_URL,
+  )
 }
 
 pub fn default_stream_url() -> String {
   crate::config::env_string(
-    &["GJTD_STREAM_URL", "JUPYTERD_STREAM_URL"],
+    &["JUD_STREAM_URL", "GJTD_STREAM_URL", "JUPYTERD_STREAM_URL"],
     DEFAULT_STREAM_URL,
   )
 }
 
 pub fn default_log() -> String {
-  crate::config::env_string(&["GJTD_LOG", "JUPYTERD_LOG"], DEFAULT_LOG)
+  crate::config::env_string(&["JUD_LOG", "GJTD_LOG", "JUPYTERD_LOG"], DEFAULT_LOG)
 }
 
 pub fn daemon_path() -> Result<PathBuf> {
   let current = std::env::current_exe()?;
-  Ok(current.with_file_name("gjtd"))
+  Ok(current.with_file_name("jud"))
 }
 
 pub fn start_daemon(
@@ -184,7 +187,7 @@ pub fn start_daemon(
       Ok(())
     });
   }
-  command.spawn().with_context(|| "start gjtd")?;
+  command.spawn().with_context(|| "start jud")?;
 
   let deadline = Instant::now() + timeout;
   while Instant::now() < deadline {
@@ -194,7 +197,7 @@ pub fn start_daemon(
     thread::sleep(Duration::from_millis(250));
   }
   bail!(
-    "gjtd did not start within {:.1}s; log: {}",
+    "jud did not start within {:.1}s; log: {}",
     timeout.as_secs_f64(),
     log_path.display()
   )
@@ -214,6 +217,6 @@ pub fn ensure_daemon(
   if auto_start {
     start_daemon(api_url, stream_url, headless, log_path, timeout)
   } else {
-    bail!("gjtd is not running at {api_url}; start it with gjtctl start")
+    bail!("jud is not running at {api_url}; start it with juctl start")
   }
 }

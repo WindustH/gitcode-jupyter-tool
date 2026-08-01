@@ -8,7 +8,7 @@ pub const DEFAULT_NOTEBOOK_PATH: &str = "quick_start/cann_basics";
 pub const DEFAULT_SCAN_FILE_PATH: &str = "quick_start/cann_basics/01_ai_basics.ipynb";
 pub const DEFAULT_API_URL: &str = "http://127.0.0.1:18787";
 pub const DEFAULT_STREAM_URL: &str = "tcp://127.0.0.1:18788";
-pub const DEFAULT_LOG: &str = "/tmp/gjtd.log";
+pub const DEFAULT_LOG: &str = "/tmp/jud.log";
 pub const DEFAULT_CDP_LIST_URL: &str = "http://127.0.0.1:9222/json";
 pub const DEFAULT_LISTEN_HOST: &str = "127.0.0.1";
 pub const DEFAULT_LISTEN_PORT: u16 = 18787;
@@ -17,7 +17,7 @@ pub const DEFAULT_STREAM_PORT: u16 = 18788;
 pub const DEFAULT_JUPYTER_CWD: &str = "~";
 
 pub fn default_config_dir() -> String {
-  for key in ["GJTD_CONFIG_DIR", "JUPYTERD_CONFIG_DIR"] {
+  for key in ["JUD_CONFIG_DIR", "GJTD_CONFIG_DIR", "JUPYTERD_CONFIG_DIR"] {
     if let Ok(value) = env::var(key)
       && !value.is_empty()
     {

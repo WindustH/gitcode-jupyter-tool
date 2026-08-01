@@ -6,10 +6,10 @@
 
 The project now builds four executables:
 
-- `gjtd`: GitCode Jupyter Tool daemon. It keeps a usable notebook available and exposes a local HTTP API plus a low-latency TCP stream.
-- `jush`: Jupyter shell client. It runs remote commands, local scripts, stdin scripts, or an interactive shell through `gjtd`.
+- `jud`: GitCode Jupyter Tool daemon. It keeps a usable notebook available and exposes a local HTTP API plus a low-latency TCP stream.
+- `jush`: Jupyter shell client. It runs remote commands, local scripts, stdin scripts, or an interactive shell through `jud`.
 - `jucp`: Jupyter copy client. It copies files or directories between local paths and `jupyter:` remote paths.
-- `gjtctl`: daemon control tool for start, stop, restart, status, and resource inspection.
+- `juctl`: daemon control tool for login, logout, start, stop, restart, status, and resource inspection.
 
 ## Configuration
 
@@ -19,7 +19,7 @@ The default config directory is:
 ${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 ```
 
-By default, `gjtd` stores:
+By default, `jud` stores:
 
 - Chrome profile: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/chrome-profile`
 - GitCode auth cache: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/auth.json`
@@ -28,15 +28,15 @@ By default, `gjtd` stores:
 The local API and stream defaults are unchanged:
 
 ```bash
-GJTD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
-GJTD_API_URL=http://127.0.0.1:18787
-GJTD_STREAM_URL=tcp://127.0.0.1:18788
-GJTD_LOG=/tmp/gjtd.log
-GJTD_CDP_PORT=9222
+JUD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
+JUD_API_URL=http://127.0.0.1:18787
+JUD_STREAM_URL=tcp://127.0.0.1:18788
+JUD_LOG=/tmp/jud.log
+JUD_CDP_PORT=9222
 JUPYTER_CWD=~
 ```
 
-The old `JUPYTERD_*` environment names are still accepted for compatibility.
+The old `GJTD_*` and `JUPYTERD_*` environment names are still accepted for compatibility.
 
 ## Build
 
@@ -47,10 +47,10 @@ cargo build --release
 The binaries are written under `target/release/`:
 
 ```bash
-target/release/gjtd
+target/release/jud
 target/release/jush
 target/release/jucp
-target/release/gjtctl
+target/release/juctl
 ```
 
 ## Prerequisites
@@ -60,33 +60,42 @@ target/release/gjtctl
 - Network access to `https://gitcode.com/cann/cann-learning-hub`.
 - A GitCode account that can open the CANN online notebook experience.
 - Local loopback ports available by default:
-  - `127.0.0.1:18787` for the `gjtd` HTTP API.
+  - `127.0.0.1:18787` for the `jud` HTTP API.
   - `127.0.0.1:18788` for the interactive shell TCP stream.
   - `127.0.0.1:9222` for Chrome DevTools.
 
 ## Usage
 
+Log in or clear the dedicated GitCode login state:
+
+```bash
+juctl login
+juctl logout
+```
+
+`juctl login` opens visible Chrome, waits for GitCode login, caches auth, and restarts `jud` if it was running. `juctl logout` stops `jud` and removes the auth cache, notebook state, and dedicated Chrome profile; use `juctl logout --keep-profile` to keep the Chrome profile.
+
 Start the daemon:
 
 ```bash
-gjtctl start
+juctl start
 ```
 
 Check daemon status and remote resources:
 
 ```bash
-gjtctl status
-gjtctl status --json
-gjtctl resources --timeout 60
+juctl status
+juctl status --json
+juctl resources --timeout 60
 ```
 
-`gjtctl resources` probes the current notebook and returns CPU, memory, NPU, CANN/toolkit, disk, and system details as JSON; `npu-smi info` is parsed into structured device/process fields.
+`juctl resources` probes the current notebook and returns CPU, memory, NPU, CANN/toolkit, disk, and system details as JSON; `npu-smi info` is parsed into structured device/process fields.
 
 Stop or restart:
 
 ```bash
-gjtctl stop
-gjtctl restart
+juctl stop
+juctl restart
 ```
 
 Run a remote interactive shell:
@@ -139,32 +148,32 @@ jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh &&
 jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
 ```
 
-Heavy requests are queued by `gjtd` and run one at a time in submission order. Normal non-heavy commands are not blocked by the heavy queue. `gjtctl status` shows the current heavy queue state.
+Heavy requests are queued by `jud` and run one at a time in submission order. Normal non-heavy commands are not blocked by the heavy queue. `juctl status` shows the current heavy queue state.
 
 ## Direct daemon use
 
 Run one maintenance pass:
 
 ```bash
-gjtd --once
+jud --once
 ```
 
 Probe only:
 
 ```bash
-gjtd --status-only
+jud --status-only
 ```
 
 Run the daemon in the foreground:
 
 ```bash
-gjtd --interval 60
+jud --interval 60
 ```
 
-The daemon runs Chrome headless by default. If the dedicated profile is not logged in, `gjtd` opens a visible Chrome window for login unless `--no-login-window` is set. Force visible Chrome:
+The daemon runs Chrome headless by default. If the dedicated profile is not logged in, `jud` opens a visible Chrome window for login unless `--no-login-window` is set. You can also force login refresh with `juctl login`. Force visible Chrome:
 
 ```bash
-gjtd --visible
+jud --visible
 ```
 
-Do not expose the local `gjtd` API to untrusted networks.
+Do not expose the local `jud` API to untrusted networks.

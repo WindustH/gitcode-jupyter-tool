@@ -22,7 +22,7 @@ fn default_timeout() -> f64 {
 #[derive(Parser)]
 #[command(
   name = "jush",
-  about = "Run a bash-like shell through gjtd.",
+  about = "Run a bash-like shell through jud.",
   trailing_var_arg = true,
   allow_hyphen_values = true
 )]
@@ -292,18 +292,18 @@ fn read_stream_header(sock: &mut TcpStream, timeout: Duration) -> Result<(Value,
       Ok(size) => size,
       Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
         bail!(
-          "gjtd stream did not become ready within {:.1}s; check /tmp/gjtd.log",
+          "jud stream did not become ready within {:.1}s; check /tmp/jud.log",
           timeout.as_secs_f64()
         );
       }
       Err(err) => return Err(err.into()),
     };
     if size == 0 {
-      bail!("gjtd stream closed before handshake");
+      bail!("jud stream closed before handshake");
     }
     data.extend_from_slice(&buf[..size]);
     if data.len() > 65536 {
-      bail!("gjtd stream handshake is too large");
+      bail!("jud stream handshake is too large");
     }
   }
   sock.set_read_timeout(None)?;
@@ -315,7 +315,7 @@ fn read_stream_header(sock: &mut TcpStream, timeout: Duration) -> Result<(Value,
 fn interactive(args: &Args) -> Result<i32> {
   ensure_daemon(args)?;
   let (rows, cols) = terminal_size(args);
-  eprintln!("Opening remote interactive shell through gjtd...");
+  eprintln!("Opening remote interactive shell through jud...");
   let mut sock = client::connect_tcp(
     &args.stream_url,
     Duration::from_secs_f64(args.daemon_start_timeout),
@@ -334,11 +334,11 @@ fn interactive(args: &Args) -> Result<i32> {
       start
         .get("error")
         .and_then(Value::as_str)
-        .unwrap_or("gjtd stream failed")
+        .unwrap_or("jud stream failed")
     );
   }
   eprintln!(
-    "Connected to {} through gjtd stream.",
+    "Connected to {} through jud stream.",
     start
       .get("href")
       .and_then(Value::as_str)

@@ -1,14 +1,15 @@
 use anyhow::Result;
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use gitcode_jupyter_tool::client;
+use gitcode_jupyter_tool::{client, config};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
-#[command(name = "gjtctl", about = "Control the local gjtd daemon.")]
+#[command(name = "juctl", about = "Control the local jud daemon.")]
 struct Cli {
   #[command(subcommand)]
   command: CommandKind,
@@ -20,6 +21,8 @@ enum CommandKind {
   Start(CommonArgs),
   Stop(StopArgs),
   Restart(StopArgs),
+  Login(LoginArgs),
+  Logout(LogoutArgs),
   Resources(CommonArgs),
 }
 
@@ -55,6 +58,30 @@ struct StopArgs {
   force: bool,
 }
 
+#[derive(Clone, ClapArgs)]
+struct LoginArgs {
+  #[arg(long, default_value_t = client::default_api_url())]
+  daemon_url: String,
+  #[arg(long, default_value_t = client::default_stream_url())]
+  stream_url: String,
+  #[arg(long, default_value_t = client::default_log())]
+  daemon_log: String,
+  #[arg(long, default_value_t = 300.0)]
+  timeout: f64,
+  #[arg(long, action = clap::ArgAction::SetTrue)]
+  no_restart: bool,
+}
+
+#[derive(Clone, ClapArgs)]
+struct LogoutArgs {
+  #[command(flatten)]
+  common: CommonArgs,
+  #[arg(long, action = clap::ArgAction::SetTrue)]
+  force: bool,
+  #[arg(long, action = clap::ArgAction::SetTrue)]
+  keep_profile: bool,
+}
+
 impl CommonArgs {
   fn headless(&self) -> bool {
     if self.visible { false } else { self.headless }
@@ -62,7 +89,7 @@ impl CommonArgs {
 }
 
 fn daemon_path() -> PathBuf {
-  client::daemon_path().unwrap_or_else(|_| PathBuf::from("gjtd"))
+  client::daemon_path().unwrap_or_else(|_| PathBuf::from("jud"))
 }
 
 fn proc_cmdline(proc_dir: &Path) -> Vec<String> {
@@ -82,7 +109,7 @@ fn proc_cwd(proc_dir: &Path) -> Option<PathBuf> {
     .and_then(|path| path.canonicalize().ok())
 }
 
-fn is_this_gjtd(proc_dir: &Path, args: &[String]) -> bool {
+fn is_this_jud(proc_dir: &Path, args: &[String]) -> bool {
   let daemon = daemon_path();
   let daemon_real = daemon.canonicalize().unwrap_or(daemon);
   let cwd = proc_cwd(proc_dir);
@@ -105,7 +132,7 @@ fn is_this_gjtd(proc_dir: &Path, args: &[String]) -> bool {
     }
   }
   let joined = args.join(" ");
-  joined.contains("gjtd")
+  joined.contains("jud")
     && daemon_real
       .parent()
       .is_some_and(|parent| joined.contains(&parent.display().to_string()))
@@ -130,7 +157,7 @@ fn daemon_processes() -> Vec<(i32, Vec<String>)> {
     }
     let proc_dir = entry.path();
     let args = proc_cmdline(&proc_dir);
-    if !args.is_empty() && is_this_gjtd(&proc_dir, &args) {
+    if !args.is_empty() && is_this_jud(&proc_dir, &args) {
       matches.push((pid, args));
     }
   }
@@ -197,7 +224,7 @@ fn stop_via_api(api_url: &str, timeout: Duration) -> bool {
 fn stop_processes(timeout: Duration, force: bool) -> i32 {
   let processes = daemon_processes();
   if processes.is_empty() {
-    println!("gjtd is not running");
+    println!("jud is not running");
     return 0;
   }
   let pids = processes.iter().map(|(pid, _)| *pid).collect::<Vec<_>>();
@@ -217,7 +244,7 @@ fn stop_processes(timeout: Duration, force: bool) -> i32 {
   }
   if !remaining.is_empty() {
     eprintln!(
-      "gjtd did not stop: {}",
+      "jud did not stop: {}",
       remaining
         .iter()
         .map(ToString::to_string)
@@ -227,7 +254,7 @@ fn stop_processes(timeout: Duration, force: bool) -> i32 {
     return 1;
   }
   println!(
-    "stopped gjtd: {}",
+    "stopped jud: {}",
     pids
       .iter()
       .map(ToString::to_string)
@@ -264,7 +291,7 @@ fn command_status(args: &StatusArgs) -> i32 {
     };
   }
   if health_ok {
-    println!("gjtd API is running at {}", args.common.daemon_url);
+    println!("jud API is running at {}", args.common.daemon_url);
     if let Some(queue) = health
       .as_ref()
       .and_then(|payload| payload.get("heavy_queue"))
@@ -278,7 +305,7 @@ fn command_status(args: &StatusArgs) -> i32 {
       );
     }
   } else {
-    println!("gjtd API is not reachable at {}", args.common.daemon_url);
+    println!("jud API is not reachable at {}", args.common.daemon_url);
   }
   for (pid, cmdline) in &processes {
     println!("pid {pid}: {}", cmdline.join(" "));
@@ -299,11 +326,11 @@ fn command_start(args: &CommonArgs) -> i32 {
     Duration::from_secs_f64(args.timeout),
   ) {
     Ok(_) => {
-      println!("gjtd is running at {}", args.daemon_url);
+      println!("jud is running at {}", args.daemon_url);
       0
     }
     Err(err) => {
-      eprintln!("gjtctl: {err:#}");
+      eprintln!("juctl: {err:#}");
       1
     }
   }
@@ -326,7 +353,7 @@ fn command_resources(args: &CommonArgs) -> i32 {
         ) {
           Ok(result) => payload = result,
           Err(err) => {
-            eprintln!("gjtctl: {err:#}");
+            eprintln!("juctl: {err:#}");
             return 1;
           }
         }
@@ -336,7 +363,7 @@ fn command_resources(args: &CommonArgs) -> i32 {
         0
       } else {
         eprintln!(
-          "gjtctl: {}",
+          "juctl: {}",
           payload
             .get("error")
             .and_then(Value::as_str)
@@ -346,10 +373,155 @@ fn command_resources(args: &CommonArgs) -> i32 {
       }
     }
     Err(err) => {
-      eprintln!("gjtctl: {err:#}");
+      eprintln!("juctl: {err:#}");
       1
     }
   }
+}
+
+fn path_from_env(keys: &[&str], default: String) -> PathBuf {
+  config::expand_tilde(config::env_string(keys, &default))
+}
+
+fn auth_cache_path() -> PathBuf {
+  path_from_env(
+    &["JUD_AUTH_CACHE", "GJTD_AUTH_CACHE", "JUPYTERD_AUTH_CACHE"],
+    config::default_auth_cache(),
+  )
+}
+
+fn state_file_path() -> PathBuf {
+  path_from_env(
+    &["JUD_STATE_FILE", "GJTD_STATE_FILE", "JUPYTERD_STATE_FILE"],
+    config::default_state_file(),
+  )
+}
+
+fn chrome_profile_path() -> PathBuf {
+  path_from_env(
+    &[
+      "JUD_CHROME_PROFILE_DIR",
+      "GJTD_CHROME_PROFILE_DIR",
+      "JUPYTERD_CHROME_PROFILE_DIR",
+    ],
+    config::default_chrome_profile(),
+  )
+}
+
+fn remove_file_if_exists(path: &Path) -> bool {
+  match fs::remove_file(path) {
+    Ok(_) => true,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+    Err(err) => {
+      eprintln!("juctl: remove {}: {err}", path.display());
+      false
+    }
+  }
+}
+
+fn remove_dir_if_exists(path: &Path) -> bool {
+  match fs::remove_dir_all(path) {
+    Ok(_) => true,
+    Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+    Err(err) => {
+      eprintln!("juctl: remove {}: {err}", path.display());
+      false
+    }
+  }
+}
+
+fn command_login(args: &LoginArgs) -> i32 {
+  let was_running = client::health(&args.daemon_url) || !daemon_processes().is_empty();
+  if was_running {
+    let stop_args = StopArgs {
+      common: CommonArgs {
+        daemon_url: args.daemon_url.clone(),
+        stream_url: args.stream_url.clone(),
+        daemon_log: args.daemon_log.clone(),
+        timeout: 10.0,
+        headless: true,
+        visible: false,
+      },
+      force: true,
+    };
+    let stop = command_stop(&stop_args);
+    if stop != 0 {
+      return stop;
+    }
+  }
+
+  let status = match Command::new(daemon_path())
+    .arg("--login")
+    .arg("--visible")
+    .arg("--login-timeout")
+    .arg(args.timeout.to_string())
+    .status()
+  {
+    Ok(status) => status,
+    Err(err) => {
+      eprintln!("juctl: start jud login: {err}");
+      return 1;
+    }
+  };
+  if !status.success() {
+    eprintln!("juctl: login failed");
+    return status.code().unwrap_or(1);
+  }
+  println!("GitCode login cached for jud");
+
+  if was_running && !args.no_restart {
+    match client::start_daemon(
+      &args.daemon_url,
+      &args.stream_url,
+      true,
+      &args.daemon_log,
+      Duration::from_secs(20),
+    ) {
+      Ok(_) => println!("jud restarted at {}", args.daemon_url),
+      Err(err) => {
+        eprintln!("juctl: restart jud after login: {err:#}");
+        return 1;
+      }
+    }
+  }
+  0
+}
+
+fn command_logout(args: &LogoutArgs) -> i32 {
+  let stop_args = StopArgs {
+    common: args.common.clone(),
+    force: args.force,
+  };
+  let stop = command_stop(&stop_args);
+  if stop != 0 {
+    return stop;
+  }
+
+  let mut removed = Vec::new();
+  let auth = auth_cache_path();
+  if remove_file_if_exists(&auth) {
+    removed.push(auth.display().to_string());
+  }
+  let state = state_file_path();
+  if remove_file_if_exists(&state) {
+    removed.push(state.display().to_string());
+  }
+  if !args.keep_profile {
+    let profile = chrome_profile_path();
+    if remove_dir_if_exists(&profile) {
+      removed.push(profile.display().to_string());
+    }
+  }
+
+  if removed.is_empty() {
+    println!("no jud login state found");
+  } else {
+    println!("removed jud login state:");
+    for path in removed {
+      println!("  {path}");
+    }
+  }
+  0
 }
 
 fn command_stop(args: &StopArgs) -> i32 {
@@ -367,6 +539,8 @@ fn run(cli: Cli) -> Result<i32> {
     CommandKind::Status(args) => command_status(&args),
     CommandKind::Start(args) => command_start(&args),
     CommandKind::Stop(args) => command_stop(&args),
+    CommandKind::Login(args) => command_login(&args),
+    CommandKind::Logout(args) => command_logout(&args),
     CommandKind::Restart(args) => {
       let stop = command_stop(&args);
       if stop != 0 {
@@ -384,7 +558,7 @@ fn main() {
   let code = match run(cli) {
     Ok(code) => code,
     Err(err) => {
-      eprintln!("gjtctl: {err:#}");
+      eprintln!("juctl: {err:#}");
       1
     }
   };
