@@ -109,9 +109,18 @@ fn proc_cwd(proc_dir: &Path) -> Option<PathBuf> {
     .and_then(|path| path.canonicalize().ok())
 }
 
+fn proc_exe(proc_dir: &Path) -> Option<PathBuf> {
+  fs::read_link(proc_dir.join("exe"))
+    .ok()
+    .and_then(|path| path.canonicalize().ok())
+}
+
 fn is_this_jud(proc_dir: &Path, args: &[String]) -> bool {
   let daemon = daemon_path();
   let daemon_real = daemon.canonicalize().unwrap_or(daemon);
+  if proc_exe(proc_dir).is_some_and(|exe| exe == daemon_real) {
+    return true;
+  }
   let cwd = proc_cwd(proc_dir);
   for arg in args {
     let path = PathBuf::from(arg);
@@ -131,11 +140,7 @@ fn is_this_jud(proc_dir: &Path, args: &[String]) -> bool {
       return true;
     }
   }
-  let joined = args.join(" ");
-  joined.contains("jud")
-    && daemon_real
-      .parent()
-      .is_some_and(|parent| joined.contains(&parent.display().to_string()))
+  false
 }
 
 fn daemon_processes() -> Vec<(i32, Vec<String>)> {
