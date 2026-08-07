@@ -152,6 +152,19 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
           .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
       }
     }
+    "/v1/reset" => {
+      let timeout =
+        Duration::from_secs_f64(body.get("timeout").and_then(Value::as_f64).unwrap_or(60.0));
+      if async_job {
+        let jobs = service.jobs.clone();
+        let service_for_job = Arc::clone(&service);
+        jobs.submit("reset", move || service_for_job.reset(timeout))
+      } else {
+        service
+          .reset(timeout)
+          .unwrap_or_else(|err| json!({"ok": false, "error": err.to_string()}))
+      }
+    }
     "/v1/download" => {
       let source = body
         .get("source")
@@ -245,7 +258,7 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
       continue;
     };
     let method = request.method().clone();
-    let path = request.url().to_string();
+    let path = request.url().split('?').next().unwrap_or("/").to_string();
     let service = Arc::clone(&service);
     let stop = Arc::clone(&stop);
     thread::spawn(move || {
@@ -284,7 +297,7 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
       let status = if response.get("ok").and_then(Value::as_bool).unwrap_or(false) {
         StatusCode(200)
       } else {
-        StatusCode(200)
+        StatusCode(400)
       };
       let _ = request.respond(
         Response::from_string(data)

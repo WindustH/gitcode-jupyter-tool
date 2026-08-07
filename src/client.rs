@@ -1,7 +1,7 @@
-use crate::config::{DEFAULT_API_URL, DEFAULT_LOG, DEFAULT_STREAM_URL, expand_tilde};
-use anyhow::{Context, Result, anyhow, bail};
+use crate::config::{expand_tilde, DEFAULT_API_URL, DEFAULT_LOG, DEFAULT_STREAM_URL};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::blocking::Client;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::fs::OpenOptions;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
@@ -183,7 +183,9 @@ pub fn start_daemon(
   }
   unsafe {
     command.pre_exec(|| {
-      libc::setsid();
+      if libc::setsid() < 0 {
+        return Err(std::io::Error::last_os_error());
+      }
       Ok(())
     });
   }

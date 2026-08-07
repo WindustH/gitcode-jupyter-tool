@@ -432,7 +432,23 @@ impl DaemonContext {
     {
       Ok(auth) => auth,
       Err(_) => {
-        let _ = runtime::open_new_tab(&self.args.cdp_list_url, &self.args.hub_url);
+        // Only open a new tab if no gitcode page tab already exists.
+        // Without this check, the direct_context retry loop opens a new tab
+        // on every iteration, causing the "反复弹出浏览器新 tab" bug.
+        let has_gitcode_tab = runtime::fetch_targets(&self.args.cdp_list_url)
+          .unwrap_or_default()
+          .iter()
+          .any(|t| {
+            t.get("type").and_then(Value::as_str) == Some("page")
+              && t
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .contains("gitcode")
+          });
+        if !has_gitcode_tab {
+          let _ = runtime::open_new_tab(&self.args.cdp_list_url, &self.args.hub_url);
+        }
         thread::sleep(Duration::from_secs_f64(self.args.hub_load_delay));
         direct::extract_cookies_from_cdp(&self.args.cdp_list_url, self.args.debug)?
       }
@@ -1118,6 +1134,214 @@ printf '%s\n' {end}
       "ok": true,
       "href": result.get("href").cloned().unwrap_or(Value::Null),
       "resources": resources,
+    }))
+  }
+
+  fn reset(&self, timeout: Duration) -> Result<Value> {
+    let context = self.direct_context(false)?;
+    let mut client = context.client;
+    let notebook = context.notebook.clone();
+    let href = notebook.lab_url.clone();
+
+    // Leave a unique flag in every running kernel so the reopened kernel can be
+    // verified to be a fresh one (the flag must be gone after a correct reset).
+    let flag_name = format!("__JUD_RESET_FLAG_{}__", token_hex(8));
+    let flag_value = token_hex(8);
+    let mut flagged_kernels: Vec<String> = Vec::new();
+    if let Ok(kernels) = direct::list_kernels(&mut client, &notebook, Duration::from_secs(15))
+      && let Some(list) = kernels.as_array()
+    {
+      for kernel in list {
+        let Some(id) = kernel.get("id").and_then(Value::as_str) else {
+          continue;
+        };
+        let code = format!("{flag_name} = '{flag_value}'");
+        match direct::kernel_execute(
+          &client,
+          &notebook,
+          id,
+          &code,
+          json!({}),
+          Duration::from_secs(30),
+        ) {
+          Ok(reply) if reply.get("status").and_then(Value::as_str) == Some("ok") => {
+            flagged_kernels.push(id.to_string());
+          }
+          Ok(reply) => log(format!(
+            "notebook reset: flag not set in kernel {id}: {reply}"
+          )),
+          Err(err) => log(format!("notebook reset: flag not set in kernel {id}: {err}")),
+        }
+      }
+    }
+
+    let mut closed_kernels: Vec<String> = Vec::new();
+    let mut closed_sessions: Vec<String> = Vec::new();
+    let mut closed_terminals: Vec<String> = Vec::new();
+
+    if let Ok(kernels) = direct::list_kernels(&mut client, &notebook, Duration::from_secs(15))
+      && let Some(list) = kernels.as_array()
+    {
+      for kernel in list {
+        let Some(id) = kernel.get("id").and_then(Value::as_str) else {
+          continue;
+        };
+        match direct::shutdown_kernel(&mut client, &notebook, id, timeout) {
+          Ok(()) => closed_kernels.push(id.to_string()),
+          Err(err) => log(format!("notebook reset: kernel {id} shutdown failed: {err}")),
+        }
+      }
+    }
+
+    if let Ok(sessions) = direct::list_sessions(&mut client, &notebook, Duration::from_secs(15))
+      && let Some(list) = sessions.as_array()
+    {
+      for session in list {
+        let Some(id) = session.get("id").and_then(Value::as_str) else {
+          continue;
+        };
+        if direct::delete_session(&mut client, &notebook, id, Duration::from_secs(10)).is_ok() {
+          closed_sessions.push(id.to_string());
+        }
+      }
+    }
+
+    if let Ok(terminals) =
+      direct::list_terminals(&mut client, &notebook, Duration::from_secs(15))
+      && let Some(list) = terminals.as_array()
+    {
+      for terminal in list {
+        let Some(name) = terminal.get("name").and_then(Value::as_str) else {
+          continue;
+        };
+        if direct::delete_terminal(&mut client, &notebook, name, Duration::from_secs(10)).is_ok() {
+          closed_terminals.push(name.to_string());
+        }
+      }
+    }
+
+    let remaining: Vec<String> = direct::list_kernels(&mut client, &notebook, Duration::from_secs(15))
+      .ok()
+      .and_then(|value| value.as_array().cloned())
+      .unwrap_or_default()
+      .iter()
+      .filter_map(|kernel| kernel.get("id").and_then(Value::as_str).map(ToString::to_string))
+      .filter(|id| !closed_kernels.contains(id))
+      .collect();
+    if !remaining.is_empty() {
+      log(format!(
+        "notebook reset: {} kernel(s) did not stop: {}",
+        remaining.len(),
+        remaining.join(", ")
+      ));
+    }
+
+    self.close();
+
+    let mut opened = json!({});
+    match direct::start_kernel(&mut client, &notebook, Duration::from_secs(60)) {
+      Ok(kernel) => {
+        let kernel_id = kernel
+          .get("id")
+          .and_then(Value::as_str)
+          .unwrap_or("")
+          .to_string();
+        let kernel_name = kernel
+          .get("name")
+          .and_then(Value::as_str)
+          .unwrap_or("")
+          .to_string();
+        opened = json!({"kernel_id": kernel_id, "kernel_name": kernel_name});
+        let notebook_path = self.context.args.scan_file_path.trim_matches('/').to_string();
+        if !kernel_id.is_empty() && !notebook_path.is_empty() {
+          match direct::open_notebook_session(
+            &mut client,
+            &notebook,
+            &notebook_path,
+            &kernel_id,
+            Duration::from_secs(30),
+          ) {
+            Ok(session) => {
+              if let Some(session_id) = session.get("id").and_then(Value::as_str) {
+                opened["session_id"] = json!(session_id);
+              }
+              opened["session_path"] = session.get("path").cloned().unwrap_or(Value::Null);
+            }
+            Err(err) => log(format!("notebook reset: reopen session failed: {err}")),
+          }
+        }
+      }
+      Err(err) => bail!("notebook reset: start kernel after shutdown failed: {err}"),
+    }
+
+    // Verify the reopened kernel is fresh: the flag set before the reset must
+    // be gone from the new kernel. The flag expression errors out (NameError)
+    // when the reset worked.
+    let mut flag_check = json!({
+        "name": flag_name.clone(),
+        "value": flag_value,
+        "set_in": flagged_kernels,
+        "cleared": Value::Null,
+    });
+    if flagged_kernels.is_empty() {
+      flag_check["note"] =
+        json!("no kernel accepted the flag before the reset; nothing to verify");
+    } else if let Some(new_kernel_id) = opened.get("kernel_id").and_then(Value::as_str) {
+      let flag_path = format!("/user_expressions/{flag_name}");
+      match direct::kernel_execute(
+        &client,
+        &notebook,
+        new_kernel_id,
+        "",
+        json!({flag_name.as_str(): flag_name.clone()}),
+        Duration::from_secs(60),
+      ) {
+        Ok(reply) => {
+          let status = reply
+            .pointer(&flag_path)
+            .and_then(|value| value.get("status"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+          flag_check["cleared"] = json!(status != "ok");
+          if status != "ok" {
+            flag_check["detail"] = reply.pointer(&flag_path).cloned().unwrap_or(Value::Null);
+          }
+        }
+        Err(err) => {
+          flag_check["check_error"] = json!(err.to_string());
+          log(format!("notebook reset: flag verification failed: {err}"));
+        }
+      }
+    }
+
+    let status = direct::probe_notebook(
+      &mut client,
+      &notebook,
+      Duration::from_secs_f64(self.context.args.probe_timeout),
+    )?;
+    let probe = json!({
+        "ok": true,
+        "href": notebook.lab_url,
+        "target_url": notebook.target_url,
+        "notebook_id": notebook.notebook_id,
+        "base_url": notebook.base_url,
+        "status": status,
+        "output": self.context.direct_probe_output(&status, &notebook),
+    });
+    self.context.record_ok_state(&probe)?;
+
+    Ok(json!({
+        "ok": true,
+        "href": href,
+        "closed": json!({
+            "kernels": closed_kernels,
+            "sessions": closed_sessions,
+            "terminals": closed_terminals,
+        }),
+        "remaining": json!({"kernels": remaining}),
+        "opened": opened,
+        "flag": flag_check,
+        "status": status,
     }))
   }
 

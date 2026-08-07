@@ -24,6 +24,7 @@ enum CommandKind {
   Login(LoginArgs),
   Logout(LogoutArgs),
   Resources(CommonArgs),
+  Reset(CommonArgs),
 }
 
 #[derive(Clone, ClapArgs)]
@@ -539,6 +540,94 @@ fn command_stop(args: &StopArgs) -> i32 {
   stop_processes(Duration::from_secs_f64(args.common.timeout), args.force)
 }
 
+fn command_reset(args: &CommonArgs) -> i32 {
+  if !client::health(&args.daemon_url) {
+    eprintln!(
+      "juctl: jud is not running at {}; start it with juctl start",
+      args.daemon_url
+    );
+    return 1;
+  }
+  match client::request(
+    &args.daemon_url,
+    "/v1/reset",
+    json!({"timeout": args.timeout}),
+    Duration::from_secs_f64(args.timeout + 120.0),
+  ) {
+    Ok(payload) => {
+      if !payload.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        eprintln!(
+          "juctl: {}",
+          payload
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("notebook reset failed")
+        );
+        return 1;
+      }
+      println!(
+        "notebook reset: {}",
+        payload.get("href").and_then(Value::as_str).unwrap_or("")
+      );
+      let count = |path: &str| {
+        payload
+          .pointer(path)
+          .and_then(Value::as_array)
+          .map(Vec::len)
+          .unwrap_or(0)
+      };
+      println!(
+        "closed: {} kernel(s), {} session(s), {} terminal(s)",
+        count("/closed/kernels"),
+        count("/closed/sessions"),
+        count("/closed/terminals"),
+      );
+      let remaining = count("/remaining/kernels");
+      if remaining > 0 {
+        eprintln!("juctl: warning: {remaining} kernel(s) did not stop");
+      }
+      if let Some(opened) = payload.get("opened") {
+        if let Some(id) = opened.get("kernel_id").and_then(Value::as_str) {
+          println!("opened kernel: {id}");
+        }
+        if let Some(id) = opened.get("session_id").and_then(Value::as_str) {
+          println!("opened session: {id}");
+        }
+      }
+      if let Some(flag) = payload.get("flag") {
+        let name = flag.get("name").and_then(Value::as_str).unwrap_or("flag");
+        let set_in = flag
+          .get("set_in")
+          .and_then(Value::as_array)
+          .map(Vec::len)
+          .unwrap_or(0);
+        println!("flag {name} left in {set_in} kernel(s) before reset");
+        match flag.get("cleared").and_then(Value::as_bool) {
+          Some(true) => println!("flag check: cleared in the new kernel — reset verified"),
+          Some(false) => {
+            eprintln!(
+              "juctl: flag check FAILED: the flag is still present in the new kernel; the reset did not take effect"
+            );
+            return 1;
+          }
+          None => {
+            if let Some(err) = flag.get("check_error").and_then(Value::as_str) {
+              eprintln!("juctl: warning: flag check inconclusive: {err}");
+            } else if set_in == 0 {
+              eprintln!("juctl: warning: no kernel accepted the flag before reset; nothing to verify");
+            }
+          }
+        }
+      }
+      0
+    }
+    Err(err) => {
+      eprintln!("juctl: {err:#}");
+      1
+    }
+  }
+}
+
 fn run(cli: Cli) -> Result<i32> {
   Ok(match cli.command {
     CommandKind::Status(args) => command_status(&args),
@@ -555,6 +644,7 @@ fn run(cli: Cli) -> Result<i32> {
       }
     }
     CommandKind::Resources(args) => command_resources(&args),
+    CommandKind::Reset(args) => command_reset(&args),
   })
 }
 

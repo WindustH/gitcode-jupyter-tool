@@ -9,7 +9,7 @@
 - `jud`：GitCode Jupyter Tool daemon，负责维护可用 notebook，并暴露本地 HTTP API 和低延迟 TCP stream。
 - `jush`：Jupyter shell 客户端，支持交互式 shell、`-c` 命令、本地脚本、stdin 脚本。
 - `jucp`：Jupyter copy 客户端，支持本地路径和 `jupyter:` 远端路径之间复制文件或目录。
-- `juctl`：daemon 控制工具，支持 login、logout、start、status、stop、restart 和资源探测。
+- `juctl`：daemon 控制工具，支持 login、logout、start、status、stop、restart、reset 和资源探测。
 
 ## 配置目录
 
@@ -91,12 +91,15 @@ juctl resources --timeout 60
 
 `juctl resources` 会探测当前 notebook，并以 JSON 输出 CPU、内存、NPU、CANN/toolkit、磁盘和系统信息；其中 `npu-smi info` 会被解析成结构化字段。
 
-停止或重启：
+停止、重启或重置 notebook：
 
 ```bash
 juctl stop
 juctl restart
+juctl reset
 ```
+
+`juctl reset` 会重置当前 notebook：先在每个运行中的 kernel 里留下唯一 flag，然后关闭远端 Jupyter 服务器上所有的 kernel（通过标准 `/api/kernels`、`/api/sessions`、`/api/terminals` 接口），关闭 notebook session 和终端，再重新打开 notebook 并启动全新 kernel。重置完成后会检查新 kernel 里的 flag 是否已消失并输出结果，用于确认 reset 确实生效（新 kernel 里 flag 已不在；如果 flag 还在，`juctl reset` 会以非零码退出）。如果 notebook 实例本身已经失效，`jud` 会自动新建一个。kernel 关闭耗时较长时可用 `juctl reset --timeout 60` 调整。
 
 进入交互式 shell：
 

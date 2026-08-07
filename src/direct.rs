@@ -1,5 +1,5 @@
 use crate::runtime::{CdpClient, WebSocket, fetch_targets};
-use crate::util::{read_json_file, write_atomic_0600};
+use crate::util::{read_json_file, token_hex, write_atomic_0600};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const GITCODE_HOST_SUFFIX: &str = "gitcode.com";
 pub const REQUIRED_COOKIE_NAMES: [&str; 2] = ["GITCODE_ACCESS_TOKEN", "GITCODE_REFRESH_TOKEN"];
@@ -588,6 +588,271 @@ pub fn probe_notebook(
       ("Origin", "https://aihub-run.gitcode.com"),
       ("Referer", &notebook.lab_url),
     ],
+    timeout,
+    true,
+  )
+}
+
+fn jupyter_headers(notebook: &NotebookInfo) -> [(&'static str, &str); 2] {
+  [
+    ("Origin", "https://aihub-run.gitcode.com"),
+    ("Referer", &notebook.lab_url),
+  ]
+}
+
+fn is_not_found(err: &anyhow::Error) -> bool {
+  err.to_string().contains("HTTP 404")
+}
+
+pub fn list_kernels(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  timeout: Duration,
+) -> Result<Value> {
+  client.request(
+    Method::GET,
+    &(notebook.base_url.clone() + "/api/kernels"),
+    None,
+    None,
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  )
+}
+
+pub fn shutdown_kernel(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  kernel_id: &str,
+  timeout: Duration,
+) -> Result<()> {
+  let base = notebook.base_url.clone() + "/api/kernels/" + &urlencoding::encode(kernel_id);
+  let headers = jupyter_headers(notebook);
+  match client.request(
+    Method::DELETE,
+    &base,
+    None,
+    None,
+    &headers,
+    timeout,
+    true,
+  ) {
+    Ok(_) => Ok(()),
+    Err(err) if is_not_found(&err) => Ok(()),
+    Err(_) => match client.request(
+      Method::POST,
+      &(base + "/shutdown"),
+      None,
+      Some(json!({})),
+      &headers,
+      timeout,
+      true,
+    ) {
+      Ok(_) => Ok(()),
+      Err(err) if is_not_found(&err) => Ok(()),
+      Err(err) => Err(err),
+    },
+  }
+}
+
+pub fn list_sessions(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  timeout: Duration,
+) -> Result<Value> {
+  client.request(
+    Method::GET,
+    &(notebook.base_url.clone() + "/api/sessions"),
+    None,
+    None,
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  )
+}
+
+pub fn delete_session(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  session_id: &str,
+  timeout: Duration,
+) -> Result<()> {
+  let url = notebook.base_url.clone() + "/api/sessions/" + &urlencoding::encode(session_id);
+  match client.request(
+    Method::DELETE,
+    &url,
+    None,
+    None,
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  ) {
+    Ok(_) => Ok(()),
+    Err(err) if is_not_found(&err) => Ok(()),
+    Err(err) => Err(err),
+  }
+}
+
+pub fn list_terminals(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  timeout: Duration,
+) -> Result<Value> {
+  client.request(
+    Method::GET,
+    &(notebook.base_url.clone() + "/api/terminals"),
+    None,
+    None,
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  )
+}
+
+pub fn delete_terminal(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  name: &str,
+  timeout: Duration,
+) -> Result<()> {
+  let url = notebook.base_url.clone() + "/api/terminals/" + &urlencoding::encode(name);
+  match client.request(
+    Method::DELETE,
+    &url,
+    None,
+    None,
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  ) {
+    Ok(_) => Ok(()),
+    Err(err) if is_not_found(&err) => Ok(()),
+    Err(err) => Err(err),
+  }
+}
+
+pub fn start_kernel(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  timeout: Duration,
+) -> Result<Value> {
+  client.request(
+    Method::POST,
+    &(notebook.base_url.clone() + "/api/kernels"),
+    None,
+    Some(json!({})),
+    &jupyter_headers(notebook),
+    timeout,
+    true,
+  )
+}
+
+pub fn kernel_execute(
+  client: &HttpClient,
+  notebook: &NotebookInfo,
+  kernel_id: &str,
+  code: &str,
+  user_expressions: Value,
+  timeout: Duration,
+) -> Result<Value> {
+  let encoded_kernel = urlencoding::encode(kernel_id);
+  let websocket_url = format!(
+    "wss://aihub-run.gitcode.com/learning/{}/{}/api/kernels/{}/channels",
+    notebook.learning_id, notebook.notebook_name, encoded_kernel
+  );
+  let cookie_url =
+    notebook.base_url.clone() + "/api/kernels/" + &encoded_kernel + "/channels";
+  let cookie_header = client.auth.cookie_header(&cookie_url);
+  let mut ws = WebSocket::connect(
+    &websocket_url,
+    &[
+      ("Cookie", cookie_header),
+      ("Origin", "https://aihub-run.gitcode.com".to_string()),
+    ],
+    Duration::from_secs(15),
+  )?;
+  let result = (|| {
+    let msg_id = format!("jud-exec-{}", token_hex(8));
+    let header = json!({
+        "msg_id": msg_id,
+        "username": "jud",
+        "session": format!("jud-session-{}", token_hex(8)),
+        "msg_type": "execute_request",
+        "version": "5.3",
+    });
+    let request = json!({
+        "header": header,
+        "parent_header": {},
+        "metadata": {},
+        "content": {
+            "code": code,
+            "silent": false,
+            "store_history": false,
+            "user_expressions": user_expressions,
+            "allow_stdin": false,
+            "stop_on_error": true,
+        },
+        "channel": "shell",
+        "buffers": [],
+    });
+    ws.send_text(&serde_json::to_string(&request)?)?;
+    let deadline = Instant::now() + timeout;
+    loop {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      if remaining.is_zero() {
+        bail!("kernel execute timed out: {kernel_id}");
+      }
+      let Some(raw) = ws.recv_text(remaining)? else {
+        bail!("kernel websocket closed: {kernel_id}");
+      };
+      let message: Value = serde_json::from_str(&raw)?;
+      let channel = message
+        .get("channel")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+      let msg_type = message
+        .get("msg_type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+      if channel == "shell"
+        && msg_type == "execute_reply"
+        && message
+          .pointer("/parent_header/msg_id")
+          .and_then(Value::as_str)
+          == Some(msg_id.as_str())
+      {
+        return Ok(
+          message
+            .get("content")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        );
+      }
+    }
+  })();
+  ws.close();
+  result
+}
+
+pub fn open_notebook_session(
+  client: &mut HttpClient,
+  notebook: &NotebookInfo,
+  path: &str,
+  kernel_id: &str,
+  timeout: Duration,
+) -> Result<Value> {
+  let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches('/');
+  client.request(
+    Method::POST,
+    &(notebook.base_url.clone() + "/api/sessions"),
+    None,
+    Some(json!({
+        "path": path,
+        "type": "notebook",
+        "name": name,
+        "kernel": {"id": kernel_id},
+    })),
+    &jupyter_headers(notebook),
     timeout,
     true,
   )

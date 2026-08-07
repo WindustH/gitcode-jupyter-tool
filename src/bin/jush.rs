@@ -387,7 +387,11 @@ fn raw_terminal_loop(mut sock: TcpStream) -> Result<()> {
       ];
       let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 50) };
       if ready < 0 {
-        bail!("poll failed");
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+          continue; // signal (e.g. SIGWINCH) — retry
+        }
+        bail!("poll failed: {}", err);
       }
       if fds[0].revents & libc::POLLIN != 0 {
         let mut buf = [0u8; 4096];

@@ -5,7 +5,6 @@ use rand::RngCore;
 use regex::Regex;
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 static ANSI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").unwrap());
@@ -62,13 +61,18 @@ pub fn write_atomic_0600(path: &Path, bytes: &[u8]) -> Result<()> {
     token_hex(4)
   ));
   {
-    let mut file = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+      .write(true)
+      .create(true)
+      .truncate(true)
+      .mode(0o600)
+      .open(&tmp)
+      .with_context(|| format!("create {}", tmp.display()))?;
     file.write_all(bytes)?;
     file.flush()?;
   }
-  fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600)).ok();
   fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
-  fs::set_permissions(path, fs::Permissions::from_mode(0o600)).ok();
   Ok(())
 }
 

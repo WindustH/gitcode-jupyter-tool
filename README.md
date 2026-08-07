@@ -9,7 +9,7 @@ The project now builds four executables:
 - `jud`: GitCode Jupyter Tool daemon. It keeps a usable notebook available and exposes a local HTTP API plus a low-latency TCP stream.
 - `jush`: Jupyter shell client. It runs remote commands, local scripts, stdin scripts, or an interactive shell through `jud`.
 - `jucp`: Jupyter copy client. It copies files or directories between local paths and `jupyter:` remote paths.
-- `juctl`: daemon control tool for login, logout, start, stop, restart, status, and resource inspection.
+- `juctl`: daemon control tool for login, logout, start, stop, restart, reset, status, and resource inspection.
 
 ## Configuration
 
@@ -91,12 +91,15 @@ juctl resources --timeout 60
 
 `juctl resources` probes the current notebook and returns CPU, memory, NPU, CANN/toolkit, disk, and system details as JSON; `npu-smi info` is parsed into structured device/process fields.
 
-Stop or restart:
+Stop, restart, or reset:
 
 ```bash
 juctl stop
 juctl restart
+juctl reset
 ```
+
+`juctl reset` resets the current notebook: it leaves a unique flag in every running kernel, shuts down all Jupyter kernels, closes notebook sessions and terminals on the remote Jupyter server (the standard `/api/kernels`, `/api/sessions`, `/api/terminals` endpoints), then reopens the notebook with a fresh kernel. After the reset it checks the new kernel and reports whether the flag is gone, so you can see that the reset really took effect (a fresh kernel no longer has the flag; `juctl reset` exits non-zero if the flag survived). If the notebook instance itself is gone, `jud` provisions a new one automatically. Use `juctl reset --timeout 60` to allow more time for kernel shutdown.
 
 Run a remote interactive shell:
 
