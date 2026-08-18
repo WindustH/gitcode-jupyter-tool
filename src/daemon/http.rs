@@ -247,11 +247,12 @@ fn dispatch(service: Arc<Service>, stop: Arc<AtomicBool>, path: &str, body: Valu
 
 pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> Result<()> {
   let args = &service.context.args;
-  let server = Server::http(format!("{}:{}", args.listen_host, args.listen_port))
+  let server = Server::http(format!("{}:{}", args.listen_host, args.listen_port()))
     .map_err(|err| anyhow!("start HTTP server: {err}"))?;
   crate::util::log(format!(
     "jud API listening on http://{}:{}",
-    args.listen_host, args.listen_port
+    args.listen_host,
+    args.listen_port()
   ));
   while !stop.load(Ordering::Relaxed) {
     let Some(mut request) = server.recv_timeout(Duration::from_millis(200))? else {
@@ -267,9 +268,10 @@ pub(super) fn run_http_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> R
             "ok": true,
             "service": "jud",
             "pid": std::process::id(),
+            "account": service.context.args.account,
             "jobs": service.jobs.stats(),
             "heavy_queue": service.heavy_queue.status(),
-            "stream_url": format!("tcp://{}:{}", service.context.args.stream_host, service.context.args.stream_port),
+            "stream_url": format!("tcp://{}:{}", service.context.args.stream_host, service.context.args.stream_port()),
         }),
         Method::Post => {
           let mut body_text = String::new();

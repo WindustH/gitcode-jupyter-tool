@@ -13,11 +13,12 @@ use std::time::Duration;
 
 pub(super) fn run_stream_server(service: Arc<Service>, stop: Arc<AtomicBool>) -> Result<()> {
   let args = &service.context.args;
-  let listener = TcpListener::bind(format!("{}:{}", args.stream_host, args.stream_port))?;
+  let listener = TcpListener::bind(format!("{}:{}", args.stream_host, args.stream_port()))?;
   listener.set_nonblocking(true)?;
   log(format!(
     "jud terminal stream listening on tcp://{}:{}",
-    args.stream_host, args.stream_port
+    args.stream_host,
+    args.stream_port()
   ));
   while !stop.load(Ordering::Relaxed) {
     match listener.accept() {

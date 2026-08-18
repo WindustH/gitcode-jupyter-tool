@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Args as ClapArgs, Parser, Subcommand};
-use gitcode_jupyter_tool::{client, config};
+use gitcode_jupyter_tool::{client, config, direct::CookieAuth};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,12 +11,18 @@ use std::time::{Duration, Instant};
 #[derive(Parser)]
 #[command(name = "juctl", about = "Control the local jud daemon.")]
 struct Cli {
+  #[arg(long, global = true, default_value_t = config::default_account())]
+  account: String,
   #[command(subcommand)]
   command: CommandKind,
 }
 
 #[derive(Subcommand)]
 enum CommandKind {
+  Accounts {
+    #[command(subcommand)]
+    command: AccountsCommand,
+  },
   Status(StatusArgs),
   Start(CommonArgs),
   Stop(StopArgs),
@@ -25,6 +31,12 @@ enum CommandKind {
   Logout(LogoutArgs),
   Resources(CommonArgs),
   Reset(CommonArgs),
+}
+
+#[derive(Subcommand)]
+enum AccountsCommand {
+  /// List configured accounts and their cached login state.
+  List,
 }
 
 #[derive(Clone, ClapArgs)]
@@ -116,9 +128,16 @@ fn proc_exe(proc_dir: &Path) -> Option<PathBuf> {
     .and_then(|path| path.canonicalize().ok())
 }
 
-fn is_this_jud(proc_dir: &Path, args: &[String]) -> bool {
+fn is_this_jud(proc_dir: &Path, args: &[String], account: &str) -> bool {
   let daemon = daemon_path();
   let daemon_real = daemon.canonicalize().unwrap_or(daemon);
+  let account_matches = args
+    .windows(2)
+    .any(|pair| pair[0] == "--account" && pair[1] == account)
+    || (account == config::DEFAULT_ACCOUNT && !args.iter().any(|arg| arg == "--account"));
+  if !account_matches {
+    return false;
+  }
   if proc_exe(proc_dir).is_some_and(|exe| exe == daemon_real) {
     return true;
   }
@@ -144,7 +163,7 @@ fn is_this_jud(proc_dir: &Path, args: &[String]) -> bool {
   false
 }
 
-fn daemon_processes() -> Vec<(i32, Vec<String>)> {
+fn daemon_processes(account: &str) -> Vec<(i32, Vec<String>)> {
   let current = std::process::id() as i32;
   let mut matches = Vec::new();
   let Ok(entries) = fs::read_dir("/proc") else {
@@ -163,7 +182,7 @@ fn daemon_processes() -> Vec<(i32, Vec<String>)> {
     }
     let proc_dir = entry.path();
     let args = proc_cmdline(&proc_dir);
-    if !args.is_empty() && is_this_jud(&proc_dir, &args) {
+    if !args.is_empty() && is_this_jud(&proc_dir, &args, account) {
       matches.push((pid, args));
     }
   }
@@ -195,7 +214,17 @@ fn wait_until_stopped(pids: &[i32], timeout: Duration) -> Vec<i32> {
   remaining
 }
 
-fn stop_via_api(api_url: &str, timeout: Duration) -> bool {
+fn stop_via_api(api_url: &str, account: &str, timeout: Duration) -> bool {
+  if let Some(payload) = client::health_payload(api_url) {
+    let actual = payload.get("account").and_then(Value::as_str);
+    let matches = actual
+      .map(|value| value == account)
+      .unwrap_or(account == config::DEFAULT_ACCOUNT);
+    if !matches {
+      eprintln!("juctl: jud at {api_url} belongs to another account; use a separate --daemon-url");
+      return false;
+    }
+  }
   let response = client::request(api_url, "/v1/shutdown", json!({}), Duration::from_secs(2));
   let Ok(response) = response else {
     return false;
@@ -227,8 +256,8 @@ fn stop_via_api(api_url: &str, timeout: Duration) -> bool {
   false
 }
 
-fn stop_processes(timeout: Duration, force: bool) -> i32 {
-  let processes = daemon_processes();
+fn stop_processes(timeout: Duration, force: bool, account: &str) -> i32 {
+  let processes = daemon_processes(account);
   if processes.is_empty() {
     println!("jud is not running");
     return 0;
@@ -270,14 +299,25 @@ fn stop_processes(timeout: Duration, force: bool) -> i32 {
   0
 }
 
-fn command_status(args: &StatusArgs) -> i32 {
+fn command_status(args: &StatusArgs, account: &str) -> i32 {
   let health = client::health_payload(&args.common.daemon_url);
   let health_ok = health
     .as_ref()
-    .and_then(|payload| payload.get("ok"))
-    .and_then(Value::as_bool)
+    .map(|payload| {
+      let actual = payload.get("account").and_then(Value::as_str);
+      let matches = actual
+        .map(|value| value == account)
+        .unwrap_or(account == config::DEFAULT_ACCOUNT);
+      if !matches {
+        eprintln!(
+          "juctl: jud at {} belongs to another account; use a separate --daemon-url",
+          args.common.daemon_url
+        );
+      }
+      payload.get("ok").and_then(Value::as_bool) == Some(true) && matches
+    })
     .unwrap_or(false);
-  let processes = daemon_processes();
+  let processes = daemon_processes(account);
   if args.json {
     println!(
       "{}",
@@ -323,10 +363,11 @@ fn command_status(args: &StatusArgs) -> i32 {
   }
 }
 
-fn command_start(args: &CommonArgs) -> i32 {
+fn command_start(args: &CommonArgs, account: &str) -> i32 {
   match client::start_daemon(
     &args.daemon_url,
     &args.stream_url,
+    account,
     args.headless(),
     &args.daemon_log,
     Duration::from_secs_f64(args.timeout),
@@ -389,29 +430,37 @@ fn path_from_env(keys: &[&str], default: String) -> PathBuf {
   config::expand_tilde(config::env_string(keys, &default))
 }
 
-fn auth_cache_path() -> PathBuf {
-  path_from_env(
-    &["JUD_AUTH_CACHE", "GJTD_AUTH_CACHE", "JUPYTERD_AUTH_CACHE"],
-    config::default_auth_cache(),
-  )
+fn auth_cache_path(account: &str) -> PathBuf {
+  let default = config::account_auth_cache(account)
+    .unwrap_or_else(|_| config::expand_tilde(config::default_auth_cache()));
+  if account == config::DEFAULT_ACCOUNT {
+    path_from_env(&["JUD_AUTH_CACHE"], default.to_string_lossy().into_owned())
+  } else {
+    default
+  }
 }
 
-fn state_file_path() -> PathBuf {
-  path_from_env(
-    &["JUD_STATE_FILE", "GJTD_STATE_FILE", "JUPYTERD_STATE_FILE"],
-    config::default_state_file(),
-  )
+fn state_file_path(account: &str) -> PathBuf {
+  let default = config::account_state_file(account)
+    .unwrap_or_else(|_| config::expand_tilde(config::default_state_file()));
+  if account == config::DEFAULT_ACCOUNT {
+    path_from_env(&["JUD_STATE_FILE"], default.to_string_lossy().into_owned())
+  } else {
+    default
+  }
 }
 
-fn chrome_profile_path() -> PathBuf {
-  path_from_env(
-    &[
-      "JUD_CHROME_PROFILE_DIR",
-      "GJTD_CHROME_PROFILE_DIR",
-      "JUPYTERD_CHROME_PROFILE_DIR",
-    ],
-    config::default_chrome_profile(),
-  )
+fn chrome_profile_path(account: &str) -> PathBuf {
+  let default = config::account_chrome_profile(account)
+    .unwrap_or_else(|_| config::expand_tilde(config::default_chrome_profile()));
+  if account == config::DEFAULT_ACCOUNT {
+    path_from_env(
+      &["JUD_CHROME_PROFILE_DIR"],
+      default.to_string_lossy().into_owned(),
+    )
+  } else {
+    default
+  }
 }
 
 fn remove_file_if_exists(path: &Path) -> bool {
@@ -436,8 +485,9 @@ fn remove_dir_if_exists(path: &Path) -> bool {
   }
 }
 
-fn command_login(args: &LoginArgs) -> i32 {
-  let was_running = client::health(&args.daemon_url) || !daemon_processes().is_empty();
+fn command_login(args: &LoginArgs, account: &str) -> i32 {
+  let was_running =
+    client::health_for_account(&args.daemon_url, account) || !daemon_processes(account).is_empty();
   if was_running {
     let stop_args = StopArgs {
       common: CommonArgs {
@@ -450,7 +500,7 @@ fn command_login(args: &LoginArgs) -> i32 {
       },
       force: true,
     };
-    let stop = command_stop(&stop_args);
+    let stop = command_stop(&stop_args, account);
     if stop != 0 {
       return stop;
     }
@@ -458,6 +508,8 @@ fn command_login(args: &LoginArgs) -> i32 {
 
   let status = match Command::new(daemon_path())
     .arg("--login")
+    .arg("--account")
+    .arg(account)
     .arg("--visible")
     .arg("--login-timeout")
     .arg(args.timeout.to_string())
@@ -479,6 +531,7 @@ fn command_login(args: &LoginArgs) -> i32 {
     match client::start_daemon(
       &args.daemon_url,
       &args.stream_url,
+      account,
       true,
       &args.daemon_log,
       Duration::from_secs(20),
@@ -493,27 +546,27 @@ fn command_login(args: &LoginArgs) -> i32 {
   0
 }
 
-fn command_logout(args: &LogoutArgs) -> i32 {
+fn command_logout(args: &LogoutArgs, account: &str) -> i32 {
   let stop_args = StopArgs {
     common: args.common.clone(),
     force: args.force,
   };
-  let stop = command_stop(&stop_args);
+  let stop = command_stop(&stop_args, account);
   if stop != 0 {
     return stop;
   }
 
   let mut removed = Vec::new();
-  let auth = auth_cache_path();
+  let auth = auth_cache_path(account);
   if remove_file_if_exists(&auth) {
     removed.push(auth.display().to_string());
   }
-  let state = state_file_path();
+  let state = state_file_path(account);
   if remove_file_if_exists(&state) {
     removed.push(state.display().to_string());
   }
   if !args.keep_profile {
-    let profile = chrome_profile_path();
+    let profile = chrome_profile_path(account);
     if remove_dir_if_exists(&profile) {
       removed.push(profile.display().to_string());
     }
@@ -530,18 +583,23 @@ fn command_logout(args: &LogoutArgs) -> i32 {
   0
 }
 
-fn command_stop(args: &StopArgs) -> i32 {
+fn command_stop(args: &StopArgs, account: &str) -> i32 {
   if stop_via_api(
     &args.common.daemon_url,
+    account,
     Duration::from_secs_f64(args.common.timeout),
   ) {
     return 0;
   }
-  stop_processes(Duration::from_secs_f64(args.common.timeout), args.force)
+  stop_processes(
+    Duration::from_secs_f64(args.common.timeout),
+    args.force,
+    account,
+  )
 }
 
-fn command_reset(args: &CommonArgs) -> i32 {
-  if !client::health(&args.daemon_url) {
+fn command_reset(args: &CommonArgs, account: &str) -> i32 {
+  if !client::health_for_account(&args.daemon_url, account) {
     eprintln!(
       "juctl: jud is not running at {}; start it with juctl start",
       args.daemon_url
@@ -614,7 +672,9 @@ fn command_reset(args: &CommonArgs) -> i32 {
             if let Some(err) = flag.get("check_error").and_then(Value::as_str) {
               eprintln!("juctl: warning: flag check inconclusive: {err}");
             } else if set_in == 0 {
-              eprintln!("juctl: warning: no kernel accepted the flag before reset; nothing to verify");
+              eprintln!(
+                "juctl: warning: no kernel accepted the flag before reset; nothing to verify"
+              );
             }
           }
         }
@@ -628,24 +688,88 @@ fn command_reset(args: &CommonArgs) -> i32 {
   }
 }
 
+fn resolve_api_urls(api_url: &mut String, stream_url: &mut String, account: &str) {
+  if *api_url == client::default_api_url() {
+    if let Ok(value) = config::account_api_url(account) {
+      *api_url = value;
+    }
+  }
+  if *stream_url == client::default_stream_url() {
+    if let Ok(value) = config::account_stream_url(account) {
+      *stream_url = value;
+    }
+  }
+}
+
+fn resolve_common_urls(args: &mut CommonArgs, account: &str) {
+  resolve_api_urls(&mut args.daemon_url, &mut args.stream_url, account);
+}
+
+fn resolve_login_urls(args: &mut LoginArgs, account: &str) {
+  resolve_api_urls(&mut args.daemon_url, &mut args.stream_url, account);
+}
+
 fn run(cli: Cli) -> Result<i32> {
+  let account = config::validate_account_name(&cli.account)?;
+  let mut cli = cli;
+  match &mut cli.command {
+    CommandKind::Accounts { .. } => {}
+    CommandKind::Status(args) => resolve_common_urls(&mut args.common, &account),
+    CommandKind::Start(args) | CommandKind::Resources(args) | CommandKind::Reset(args) => {
+      resolve_common_urls(args, &account)
+    }
+    CommandKind::Stop(args) | CommandKind::Restart(args) => {
+      resolve_common_urls(&mut args.common, &account)
+    }
+    CommandKind::Login(args) => resolve_login_urls(args, &account),
+    CommandKind::Logout(args) => resolve_common_urls(&mut args.common, &account),
+  }
   Ok(match cli.command {
-    CommandKind::Status(args) => command_status(&args),
-    CommandKind::Start(args) => command_start(&args),
-    CommandKind::Stop(args) => command_stop(&args),
-    CommandKind::Login(args) => command_login(&args),
-    CommandKind::Logout(args) => command_logout(&args),
+    CommandKind::Accounts { command } => command_accounts(command),
+    CommandKind::Status(args) => command_status(&args, &account),
+    CommandKind::Start(args) => command_start(&args, &account),
+    CommandKind::Stop(args) => command_stop(&args, &account),
+    CommandKind::Login(args) => command_login(&args, &account),
+    CommandKind::Logout(args) => command_logout(&args, &account),
     CommandKind::Restart(args) => {
-      let stop = command_stop(&args);
+      let stop = command_stop(&args, &account);
       if stop != 0 {
         stop
       } else {
-        command_start(&args.common)
+        command_start(&args.common, &account)
       }
     }
     CommandKind::Resources(args) => command_resources(&args),
-    CommandKind::Reset(args) => command_reset(&args),
+    CommandKind::Reset(args) => command_reset(&args, &account),
   })
+}
+
+fn command_accounts(command: AccountsCommand) -> i32 {
+  match command {
+    AccountsCommand::List => {
+      let result: anyhow::Result<()> = (|| {
+        for account in config::list_accounts() {
+          let path = config::account_auth_cache(&account)?;
+          let marker = match CookieAuth::from_cache(&path) {
+            Ok(auth) if auth.valid(0.0) => {
+              format!("logged in ({} cookies)", auth.cookies.len())
+            }
+            Ok(auth) => format!("expired or incomplete ({} cookies)", auth.cookies.len()),
+            Err(_) => "not logged in".to_string(),
+          };
+          println!("{account}: {marker} [{}]", path.display());
+        }
+        Ok(())
+      })();
+      match result {
+        Ok(()) => 0,
+        Err(err) => {
+          eprintln!("juctl: {err:#}");
+          1
+        }
+      }
+    }
+  }
 }
 
 fn main() {

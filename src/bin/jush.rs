@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 fn default_timeout() -> f64 {
-  config::env_f64(&["JUSH_TIMEOUT", "JUPYTER_SH_TIMEOUT"], 180.0)
+  config::env_f64(&["JUSH_TIMEOUT"], 180.0)
 }
 
 #[derive(Parser)]
@@ -27,6 +27,8 @@ fn default_timeout() -> f64 {
   allow_hyphen_values = true
 )]
 struct Args {
+  #[arg(long, default_value_t = config::default_account())]
+  account: String,
   #[arg(short = 'c', value_name = "command")]
   command_string: Option<String>,
   #[arg(short = 's', action = ArgAction::SetTrue)]
@@ -225,10 +227,24 @@ fn ensure_daemon(args: &Args) -> Result<()> {
     &args.daemon_url,
     args.start_daemon,
     &args.stream_url,
+    &args.account,
     true,
     &client::default_log(),
     Duration::from_secs_f64(args.daemon_start_timeout),
   )
+}
+
+fn resolve_account_urls(args: &mut Args) {
+  if args.daemon_url == client::default_api_url() {
+    if let Ok(value) = config::account_api_url(&args.account) {
+      args.daemon_url = value;
+    }
+  }
+  if args.stream_url == client::default_stream_url() {
+    if let Ok(value) = config::account_stream_url(&args.account) {
+      args.stream_url = value;
+    }
+  }
 }
 
 fn run_command(command: String, args: &Args) -> Result<i32> {
@@ -429,7 +445,8 @@ fn raw_terminal_loop(mut sock: TcpStream) -> Result<()> {
 }
 
 fn main() {
-  let args = Args::parse();
+  let mut args = Args::parse();
+  resolve_account_urls(&mut args);
   let code = match command_from_args(&args).and_then(|command| match command {
     Some(command) => run_command(command, &args),
     None => interactive(&args),

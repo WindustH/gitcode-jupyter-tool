@@ -11,14 +11,14 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{self, Cursor, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tar::{Archive, Builder};
 
 const REMOTE_PREFIX: &str = "jupyter:";
 
 fn default_timeout() -> f64 {
-  config::env_f64(&["JUCP_TIMEOUT", "JUPYTER_SH_TIMEOUT"], 180.0)
+  config::env_f64(&["JUCP_TIMEOUT"], 180.0)
 }
 
 #[derive(Parser)]
@@ -27,6 +27,8 @@ fn default_timeout() -> f64 {
   about = "Copy between the local filesystem and jupyter: paths."
 )]
 struct Args {
+  #[arg(long, default_value_t = config::default_account())]
+  account: String,
   #[arg(short = 'R', short_alias = 'r', long, action = ArgAction::SetTrue)]
   recursive: bool,
   source: String,
@@ -132,7 +134,24 @@ fn unpack_directory_archive(payload: &[u8], destination: &Path) -> Result<()> {
   fs::create_dir_all(destination)?;
   let decoder = GzDecoder::new(Cursor::new(payload));
   let mut archive = Archive::new(decoder);
-  archive.unpack(destination)?;
+  for entry in archive.entries()? {
+    let mut entry = entry?;
+    let path = entry.path()?.to_path_buf();
+    if path.is_absolute()
+      || path.components().any(|component| {
+        matches!(
+          component,
+          Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+      })
+    {
+      bail!("remote archive contains an unsafe path: {}", path.display());
+    }
+    if entry.header().entry_type().is_symlink() || entry.header().entry_type().is_hard_link() {
+      bail!("remote archive contains a link entry: {}", path.display());
+    }
+    entry.unpack_in(destination)?;
+  }
   Ok(())
 }
 
@@ -141,10 +160,24 @@ fn ensure_daemon(args: &Args) -> Result<()> {
     &args.daemon_url,
     args.start_daemon,
     &args.stream_url,
+    &args.account,
     true,
     &client::default_log(),
     Duration::from_secs_f64(args.daemon_start_timeout),
   )
+}
+
+fn resolve_account_urls(args: &mut Args) {
+  if args.daemon_url == client::default_api_url() {
+    if let Ok(value) = config::account_api_url(&args.account) {
+      args.daemon_url = value;
+    }
+  }
+  if args.stream_url == client::default_stream_url() {
+    if let Ok(value) = config::account_stream_url(&args.account) {
+      args.stream_url = value;
+    }
+  }
 }
 
 fn upload(args: &Args) -> Result<()> {
@@ -278,7 +311,8 @@ fn run(args: &Args) -> Result<i32> {
 }
 
 fn main() {
-  let args = Args::parse();
+  let mut args = Args::parse();
+  resolve_account_urls(&mut args);
   let code = match run(&args) {
     Ok(code) => code,
     Err(err) => {

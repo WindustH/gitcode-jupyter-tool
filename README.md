@@ -21,22 +21,25 @@ ${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 
 By default, `jud` stores:
 
-- Chrome profile: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/chrome-profile`
+- Chrome profile: `${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool/chrome-profile`
 - GitCode auth cache: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/auth.json`
 - notebook state: `${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/state.json`
 
-The local API and stream defaults are unchanged:
+The local API, stream, and Chrome DevTools endpoints are selected per account at runtime:
 
 ```bash
 JUD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
-JUD_API_URL=http://127.0.0.1:18787
-JUD_STREAM_URL=tcp://127.0.0.1:18788
+JUD_CACHE_DIR=${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool
 JUD_LOG=/tmp/jud.log
-JUD_CDP_PORT=9222
 JUPYTER_CWD=~
 ```
 
-The old `GJTD_*` and `JUPYTERD_*` environment names are still accepted for compatibility.
+All accounts dynamically select free API/stream ports from `61000–61199` and
+Chrome CDP ports from `61800–61999`; the selected endpoints are persisted per
+account. Explicit `JUD_API_URL`, `JUD_STREAM_URL`, or `JUD_CDP_PORT` values can
+still be used when integrating with an external layout.
+
+Only the `JUD_*` environment names are supported.
 
 ## Build
 
@@ -60,9 +63,8 @@ target/release/juctl
 - Network access to `https://gitcode.com/cann/cann-learning-hub`.
 - A GitCode account that can open the CANN online notebook experience.
 - Local loopback ports available by default:
-  - `127.0.0.1:18787` for the `jud` HTTP API.
-  - `127.0.0.1:18788` for the interactive shell TCP stream.
-  - `127.0.0.1:9222` for Chrome DevTools.
+  - a free API/stream pair from `61000–61199`.
+  - a free Chrome DevTools port from `61800–61999`.
 
 ## Usage
 
@@ -74,6 +76,26 @@ juctl logout
 ```
 
 `juctl login` opens visible Chrome, waits for GitCode login, caches auth, and restarts `jud` if it was running. `juctl logout` stops `jud` and removes the auth cache, notebook state, and dedicated Chrome profile; use `juctl logout --keep-profile` to keep the Chrome profile.
+
+Accounts are independent. Use `--account NAME` (or `JUD_ACCOUNT`) with `jud`,
+`juctl`, `jush`, and `jucp`; each account gets its own auth/state/profile and
+runtime-selected local API/stream ports:
+
+```bash
+juctl accounts list
+juctl --account default login
+juctl --account work login
+juctl --account work start
+jush --account work -c 'pwd'
+```
+
+The profile is disposable browser state: removing `${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool`
+will require a new browser login, while the auth cache remains in the config directory.
+
+The notebook NPU resources are shared across accounts. Do not add `--heavy` to
+`jush` or `jucp` by default: it only serializes requests inside one `jud`
+daemon and cannot isolate shared NPU resources. Timing from `jush` is not valid
+performance evidence; use a dedicated isolated environment for benchmarking.
 
 Start the daemon:
 
@@ -142,16 +164,17 @@ jucp -r jupyter:/workspace/notebook1/logs ./logs
 
 Remote paths must start with `jupyter:`. Exactly one side must be local and exactly one side must be remote.
 
-## Heavy workload queue
+## Execution and performance note
 
-Long builds, tests, profiling runs, and large copies can be marked heavy:
+Use ordinary commands for remote work:
 
 ```bash
-jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
-jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
+jush --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
+jucp -r ./cases jupyter:/workspace/notebook1/cases
 ```
 
-Heavy requests are queued by `jud` and run one at a time in submission order. Normal non-heavy commands are not blocked by the heavy queue. `juctl status` shows the current heavy queue state.
+`--heavy` remains accepted for explicit daemon-local serialization, but it is
+not needed for normal use and does not make NPU performance measurements valid.
 
 ## Direct daemon use
 

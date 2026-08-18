@@ -127,7 +127,7 @@ impl CookieAuth {
       .filter(|cookie| {
         !cookie_expired(cookie, 0.0)
           && domain_matches(&cookie.domain, host)
-          && path.starts_with(cookie.path.trim_end_matches('/'))
+          && path_matches(&cookie.path, path)
       })
       .collect();
     selected.sort_by_key(|cookie| std::cmp::Reverse(cookie.path.len()));
@@ -146,7 +146,12 @@ impl CookieAuth {
     self
       .cookies
       .iter()
-      .find(|cookie| cookie.name == "_xsrf" && domain_matches(&cookie.domain, host))
+      .find(|cookie| {
+        cookie.name == "_xsrf"
+          && !cookie_expired(cookie, 0.0)
+          && domain_matches(&cookie.domain, host)
+          && path_matches(&cookie.path, parsed.path())
+      })
       .map(|cookie| cookie.value.clone())
       .unwrap_or_default()
   }
@@ -184,6 +189,22 @@ pub fn domain_matches(cookie_domain: &str, host: &str) -> bool {
   } else {
     host == domain
   }
+}
+
+pub fn path_matches(cookie_path: &str, request_path: &str) -> bool {
+  let cookie_path = if cookie_path.is_empty() {
+    "/"
+  } else {
+    cookie_path
+  };
+  if cookie_path == "/" {
+    return true;
+  }
+  let cookie_path = cookie_path.trim_end_matches('/');
+  request_path == cookie_path
+    || request_path
+      .strip_prefix(cookie_path)
+      .is_some_and(|rest| rest.starts_with('/'))
 }
 
 pub fn cookie_expired(cookie: &Cookie, margin: f64) -> bool {
@@ -231,11 +252,11 @@ fn parse_set_cookie(url: &str, raw: &str) -> Option<Cookie> {
   let mut parts = raw.split(';').map(str::trim);
   let first = parts.next()?;
   let (name, value) = first.split_once('=')?;
-  if name.is_empty() || value.is_empty() {
+  if name.trim().is_empty() {
     return None;
   }
   let mut cookie = Cookie {
-    name: name.to_string(),
+    name: name.trim().to_string(),
     value: value.to_string(),
     domain: host,
     path: "/".to_string(),
@@ -416,7 +437,14 @@ pub fn extract_cookies_from_cdp(cdp_list_url: &str, debug: bool) -> Result<Cooki
     .filter(|target| target.get("type").and_then(Value::as_str) == Some("page"))
     .collect();
   let first = pages
-    .first()
+    .iter()
+    .find(|target| {
+      target
+        .get("url")
+        .and_then(Value::as_str)
+        .is_some_and(|url| is_gitcode_url(url))
+    })
+    .or_else(|| pages.first())
     .ok_or_else(|| anyhow!("no Chrome page is available for cookie extraction"))?;
   let websocket_url = first
     .get("webSocketDebuggerUrl")
@@ -448,6 +476,13 @@ pub fn extract_cookies_from_cdp(cdp_list_url: &str, debug: bool) -> Result<Cooki
   })();
   cdp.close();
   result
+}
+
+fn is_gitcode_url(url: &str) -> bool {
+  url::Url::parse(url)
+    .ok()
+    .and_then(|parsed| parsed.host_str().map(is_gitcode_domain))
+    .unwrap_or(false)
 }
 
 pub fn notebook_from_insert(
@@ -628,15 +663,7 @@ pub fn shutdown_kernel(
 ) -> Result<()> {
   let base = notebook.base_url.clone() + "/api/kernels/" + &urlencoding::encode(kernel_id);
   let headers = jupyter_headers(notebook);
-  match client.request(
-    Method::DELETE,
-    &base,
-    None,
-    None,
-    &headers,
-    timeout,
-    true,
-  ) {
+  match client.request(Method::DELETE, &base, None, None, &headers, timeout, true) {
     Ok(_) => Ok(()),
     Err(err) if is_not_found(&err) => Ok(()),
     Err(_) => match client.request(
@@ -760,8 +787,7 @@ pub fn kernel_execute(
     "wss://aihub-run.gitcode.com/learning/{}/{}/api/kernels/{}/channels",
     notebook.learning_id, notebook.notebook_name, encoded_kernel
   );
-  let cookie_url =
-    notebook.base_url.clone() + "/api/kernels/" + &encoded_kernel + "/channels";
+  let cookie_url = notebook.base_url.clone() + "/api/kernels/" + &encoded_kernel + "/channels";
   let cookie_header = client.auth.cookie_header(&cookie_url);
   let mut ws = WebSocket::connect(
     &websocket_url,
@@ -806,10 +832,7 @@ pub fn kernel_execute(
         bail!("kernel websocket closed: {kernel_id}");
       };
       let message: Value = serde_json::from_str(&raw)?;
-      let channel = message
-        .get("channel")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+      let channel = message.get("channel").and_then(Value::as_str).unwrap_or("");
       let msg_type = message
         .get("msg_type")
         .and_then(Value::as_str)
@@ -821,12 +844,7 @@ pub fn kernel_execute(
           .and_then(Value::as_str)
           == Some(msg_id.as_str())
       {
-        return Ok(
-          message
-            .get("content")
-            .cloned()
-            .unwrap_or_else(|| json!({})),
-        );
+        return Ok(message.get("content").cloned().unwrap_or_else(|| json!({})));
       }
     }
   })();
@@ -841,7 +859,11 @@ pub fn open_notebook_session(
   kernel_id: &str,
   timeout: Duration,
 ) -> Result<Value> {
-  let name = path.rsplit('/').next().unwrap_or(path).trim_end_matches('/');
+  let name = path
+    .rsplit('/')
+    .next()
+    .unwrap_or(path)
+    .trim_end_matches('/');
   client.request(
     Method::POST,
     &(notebook.base_url.clone() + "/api/sessions"),
@@ -985,5 +1007,51 @@ impl ApiTerminal {
       );
       self.name.clear();
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Cookie, CookieAuth, path_matches};
+
+  #[test]
+  fn cookie_path_requires_a_segment_boundary() {
+    assert!(path_matches("/api", "/api"));
+    assert!(path_matches("/api", "/api/kernels"));
+    assert!(!path_matches("/api", "/apix"));
+  }
+
+  #[test]
+  fn cookie_header_filters_by_request_path() {
+    let auth = CookieAuth {
+      cookies: vec![
+        Cookie {
+          name: "root".to_string(),
+          value: "1".to_string(),
+          domain: "gitcode.com".to_string(),
+          path: "/".to_string(),
+          expires: None,
+          secure: true,
+          http_only: false,
+          same_site: None,
+        },
+        Cookie {
+          name: "api".to_string(),
+          value: "2".to_string(),
+          domain: "gitcode.com".to_string(),
+          path: "/api".to_string(),
+          expires: None,
+          secure: true,
+          http_only: false,
+          same_site: None,
+        },
+      ],
+      source: "test".to_string(),
+    };
+    assert_eq!(
+      auth.cookie_header("https://gitcode.com/api/kernels"),
+      "api=2; root=1"
+    );
+    assert_eq!(auth.cookie_header("https://gitcode.com/apix"), "root=1");
   }
 }

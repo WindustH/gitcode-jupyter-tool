@@ -4,7 +4,6 @@ mod jobs;
 mod stream;
 mod terminal;
 
-use crate::config;
 use crate::direct::{self, ApiTerminal, CookieAuth, HttpClient, NotebookInfo};
 use crate::runtime;
 use crate::util::{log, shell_quote, token_hex, write_json_file};
@@ -275,15 +274,15 @@ impl DaemonContext {
   }
 
   fn auth_cache_path(&self) -> PathBuf {
-    config::expand_tilde(&self.args.auth_cache)
+    self.args.auth_cache_path()
   }
 
   fn state_file_path(&self) -> PathBuf {
-    config::expand_tilde(&self.args.state_file)
+    self.args.state_file_path()
   }
 
   fn prepare_chrome_user_data_dir(&self) -> Result<PathBuf> {
-    let profile = config::expand_tilde(&self.args.chrome_user_data_dir);
+    let profile = self.args.chrome_user_data_path();
     fs::create_dir_all(&profile)?;
     for name in ["SingletonCookie", "SingletonLock", "SingletonSocket"] {
       let _ = fs::remove_file(profile.join(name));
@@ -346,7 +345,7 @@ impl DaemonContext {
     let user_data_dir = self.prepare_chrome_user_data_dir()?;
     let mut command = Command::new(&self.args.chrome_bin);
     command
-      .arg(format!("--remote-debugging-port={}", self.args.cdp_port))
+      .arg(format!("--remote-debugging-port={}", self.args.cdp_port()))
       .arg("--remote-debugging-address=127.0.0.1")
       .arg(format!("--user-data-dir={}", user_data_dir.display()))
       .arg(format!(
@@ -375,7 +374,8 @@ impl DaemonContext {
   }
 
   fn ensure_cdp(&self, headless: bool) -> Result<()> {
-    if runtime::fetch_targets(&self.args.cdp_list_url).is_ok() {
+    let cdp_list_url = self.args.cdp_list_url();
+    if runtime::fetch_targets(&cdp_list_url).is_ok() {
       return Ok(());
     }
     if self.args.no_launch {
@@ -396,7 +396,7 @@ impl DaemonContext {
     let deadline = Instant::now() + Duration::from_secs_f64(self.args.chrome_start_timeout);
     let mut last_error: Option<String> = None;
     while Instant::now() < deadline {
-      match runtime::fetch_targets(&self.args.cdp_list_url) {
+      match runtime::fetch_targets(&cdp_list_url) {
         Ok(_) => return Ok(()),
         Err(err) => {
           last_error = Some(err.to_string());
@@ -428,14 +428,14 @@ impl DaemonContext {
 
   fn extract_auth_from_chrome(&self, headless: bool) -> Result<CookieAuth> {
     self.ensure_cdp(headless)?;
-    let mut auth = match direct::extract_cookies_from_cdp(&self.args.cdp_list_url, self.args.debug)
-    {
+    let cdp_list_url = self.args.cdp_list_url();
+    let mut auth = match direct::extract_cookies_from_cdp(&cdp_list_url, self.args.debug) {
       Ok(auth) => auth,
       Err(_) => {
         // Only open a new tab if no gitcode page tab already exists.
         // Without this check, the direct_context retry loop opens a new tab
         // on every iteration, causing the "反复弹出浏览器新 tab" bug.
-        let has_gitcode_tab = runtime::fetch_targets(&self.args.cdp_list_url)
+        let has_gitcode_tab = runtime::fetch_targets(&cdp_list_url)
           .unwrap_or_default()
           .iter()
           .any(|t| {
@@ -447,10 +447,10 @@ impl DaemonContext {
                 .contains("gitcode")
           });
         if !has_gitcode_tab {
-          let _ = runtime::open_new_tab(&self.args.cdp_list_url, &self.args.hub_url);
+          let _ = runtime::open_new_tab(&cdp_list_url, &self.args.hub_url);
         }
         thread::sleep(Duration::from_secs_f64(self.args.hub_load_delay));
-        direct::extract_cookies_from_cdp(&self.args.cdp_list_url, self.args.debug)?
+        direct::extract_cookies_from_cdp(&cdp_list_url, self.args.debug)?
       }
     };
     auth.source = "chrome-cdp".to_string();
@@ -642,7 +642,7 @@ impl DaemonContext {
   }
 
   fn write_state(&self, data: Value) -> Result<()> {
-    if self.args.state_file.is_empty() {
+    if self.args.state_file.as_deref() == Some("") {
       return Ok(());
     }
     write_json_file(&self.state_file_path(), &data)
@@ -661,7 +661,7 @@ impl DaemonContext {
         "remote_last_activity": status.get("last_activity").cloned().unwrap_or(Value::Null),
         "target_url_contains": self.args.notebook_target_contains,
         "page_url_contains": self.args.notebook_page_contains,
-        "profile": config::expand_tilde(&self.args.chrome_user_data_dir).display().to_string(),
+        "profile": self.args.chrome_user_data_path().display().to_string(),
         "probe": probe.get("output").cloned().unwrap_or(Value::Null),
         "time": direct::now(),
     }))
@@ -1170,7 +1170,9 @@ printf '%s\n' {end}
           Ok(reply) => log(format!(
             "notebook reset: flag not set in kernel {id}: {reply}"
           )),
-          Err(err) => log(format!("notebook reset: flag not set in kernel {id}: {err}")),
+          Err(err) => log(format!(
+            "notebook reset: flag not set in kernel {id}: {err}"
+          )),
         }
       }
     }
@@ -1188,7 +1190,9 @@ printf '%s\n' {end}
         };
         match direct::shutdown_kernel(&mut client, &notebook, id, timeout) {
           Ok(()) => closed_kernels.push(id.to_string()),
-          Err(err) => log(format!("notebook reset: kernel {id} shutdown failed: {err}")),
+          Err(err) => log(format!(
+            "notebook reset: kernel {id} shutdown failed: {err}"
+          )),
         }
       }
     }
@@ -1206,8 +1210,7 @@ printf '%s\n' {end}
       }
     }
 
-    if let Ok(terminals) =
-      direct::list_terminals(&mut client, &notebook, Duration::from_secs(15))
+    if let Ok(terminals) = direct::list_terminals(&mut client, &notebook, Duration::from_secs(15))
       && let Some(list) = terminals.as_array()
     {
       for terminal in list {
@@ -1220,14 +1223,20 @@ printf '%s\n' {end}
       }
     }
 
-    let remaining: Vec<String> = direct::list_kernels(&mut client, &notebook, Duration::from_secs(15))
-      .ok()
-      .and_then(|value| value.as_array().cloned())
-      .unwrap_or_default()
-      .iter()
-      .filter_map(|kernel| kernel.get("id").and_then(Value::as_str).map(ToString::to_string))
-      .filter(|id| !closed_kernels.contains(id))
-      .collect();
+    let remaining: Vec<String> =
+      direct::list_kernels(&mut client, &notebook, Duration::from_secs(15))
+        .ok()
+        .and_then(|value| value.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|kernel| {
+          kernel
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        })
+        .filter(|id| !closed_kernels.contains(id))
+        .collect();
     if !remaining.is_empty() {
       log(format!(
         "notebook reset: {} kernel(s) did not stop: {}",
@@ -1252,7 +1261,12 @@ printf '%s\n' {end}
           .unwrap_or("")
           .to_string();
         opened = json!({"kernel_id": kernel_id, "kernel_name": kernel_name});
-        let notebook_path = self.context.args.scan_file_path.trim_matches('/').to_string();
+        let notebook_path = self
+          .context
+          .args
+          .scan_file_path
+          .trim_matches('/')
+          .to_string();
         if !kernel_id.is_empty() && !notebook_path.is_empty() {
           match direct::open_notebook_session(
             &mut client,
@@ -1284,8 +1298,7 @@ printf '%s\n' {end}
         "cleared": Value::Null,
     });
     if flagged_kernels.is_empty() {
-      flag_check["note"] =
-        json!("no kernel accepted the flag before the reset; nothing to verify");
+      flag_check["note"] = json!("no kernel accepted the flag before the reset; nothing to verify");
     } else if let Some(new_kernel_id) = opened.get("kernel_id").and_then(Value::as_str) {
       let flag_path = format!("/user_expressions/{flag_name}");
       match direct::kernel_execute(
@@ -1447,6 +1460,10 @@ fn run_server(context: Arc<DaemonContext>) -> Result<i32> {
 
 pub fn run_cli() {
   let args = Args::parse();
+  if let Err(err) = crate::config::validate_account_name(&args.account) {
+    eprintln!("jud: {err:#}");
+    std::process::exit(2);
+  }
   let context = Arc::new(DaemonContext::new(args.clone()));
   let code = if args.login {
     match context.login_once() {

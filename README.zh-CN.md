@@ -21,22 +21,24 @@ ${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
 
 默认文件位置：
 
-- Chrome profile：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/chrome-profile`
+- Chrome profile：`${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool/chrome-profile`
 - GitCode auth cache：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/auth.json`
 - notebook state：`${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool/state.json`
 
-默认本地端口：
+本地 API、stream 和 Chrome DevTools 端口都按账号运行时动态选择：
 
 ```bash
 JUD_CONFIG_DIR=${XDG_CONFIG_HOME:-~/.config}/gitcode-jupyter-tool
-JUD_API_URL=http://127.0.0.1:18787
-JUD_STREAM_URL=tcp://127.0.0.1:18788
+JUD_CACHE_DIR=${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool
 JUD_LOG=/tmp/jud.log
-JUD_CDP_PORT=9222
 JUPYTER_CWD=~
 ```
 
-为了兼容旧调用，原来的 `GJTD_*` 和 `JUPYTERD_*` 环境变量名仍然会被读取。
+所有账号都会在 `61000–61199` 中动态选择 API/stream 端口，在 `61800–61999` 中动态
+选择 Chrome CDP 端口，并按账号保存选择结果。需要接入外部端口布局时，可以显式设置
+`JUD_API_URL`、`JUD_STREAM_URL` 或 `JUD_CDP_PORT`。
+
+只支持 `JUD_*` 环境变量名。
 
 ## 构建
 
@@ -59,21 +61,38 @@ target/release/juctl
 - 已安装 Google Chrome 或兼容的 Chrome 浏览器；默认命令是 `google-chrome-stable`，也可以用环境变量 `CHROME` 指定。
 - 能访问 `https://gitcode.com/cann/cann-learning-hub`。
 - 有可登录 GitCode 的账号。首次使用时，如果专用 profile 未登录，`jud` 会打开可见 Chrome 窗口让你登录。
-- 默认需要以下本地端口可用：
-  - `127.0.0.1:18787`：`jud` HTTP API
-  - `127.0.0.1:18788`：交互式 shell TCP stream
-  - `127.0.0.1:9222`：Chrome DevTools
+- 默认需要端口池中有可用端口：API/stream 使用 `61000–61199`，Chrome DevTools 使用
+  `61800–61999`。
 
 ## 快速开始
 
 登录或清理专用 GitCode 登录状态：
 
 ```bash
+juctl accounts list
+juctl --account default login
 juctl login
 juctl logout
 ```
 
 `juctl login` 会打开可见 Chrome，等待你完成 GitCode 登录，缓存 auth；如果 `jud` 原本在运行，登录成功后会自动重启。`juctl logout` 会停止 `jud`，删除 auth cache、notebook state 和专用 Chrome profile；如果想保留 Chrome profile，可用 `juctl logout --keep-profile`。
+
+多个账号可以并存。给 `jud`、`juctl`、`jush`、`jucp` 加上
+`--account NAME`（或设置 `JUD_ACCOUNT`），每个账号会使用独立的 auth/state/profile，
+并在运行时选择独立的本地 API/stream 端口：
+
+```bash
+juctl --account work login
+juctl --account work start
+jush --account work -c 'pwd'
+```
+
+Chrome profile 属于可清理的浏览器状态；删除 `${XDG_CACHE_HOME:-~/.cache}/gitcode-jupyter-tool`
+后只需重新登录，配置目录中的 auth cache 不会随之删除。
+
+Notebook 的 NPU 资源会被多个账号共享。默认不要给 `jush` 或 `jucp` 添加
+`--heavy`：它最多只会在单个 `jud` daemon 内串行请求，不能隔离共享的 NPU 资源。
+因此 `jush` 的耗时不能作为性能依据；需要性能测试时应使用独立隔离的环境。
 
 启动 daemon：
 
@@ -162,16 +181,17 @@ jucp -r ./cases jupyter:/workspace/notebook1/cases
 jucp -r jupyter:/workspace/notebook1/logs ./logs
 ```
 
-## Heavy 任务队列
+## 执行和性能说明
 
-长时间构建、测试、profiling 和大文件复制可以标记为 heavy：
+远端工作直接使用普通命令：
 
 ```bash
-jush --heavy --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
-jucp --heavy -r ./cases jupyter:/workspace/notebook1/cases
+jush --timeout 1800 -c 'cd /workspace/notebook1/work && bash build.sh && ./test'
+jucp -r ./cases jupyter:/workspace/notebook1/cases
 ```
 
-`jud` 会把 heavy 请求放进队列，并按提交顺序一次只执行一个。普通非 heavy 命令不会被 heavy 队列阻塞。`juctl status` 会显示当前 heavy 队列状态。
+`--heavy` 仍可用于显式要求单个 daemon 内串行执行，但普通使用不需要添加，
+也不能让 NPU 性能测试变得有效。
 
 ## 直接运行 daemon
 

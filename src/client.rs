@@ -1,7 +1,7 @@
-use crate::config::{expand_tilde, DEFAULT_API_URL, DEFAULT_LOG, DEFAULT_STREAM_URL};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::config::{DEFAULT_API_URL, DEFAULT_LOG, DEFAULT_STREAM_URL, expand_tilde};
+use anyhow::{Context, Result, anyhow, bail};
 use reqwest::blocking::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::fs::OpenOptions;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::process::CommandExt;
@@ -39,6 +39,22 @@ pub fn health(api_url: &str) -> bool {
   health_payload(api_url)
     .and_then(|payload| payload.get("ok").and_then(Value::as_bool))
     .unwrap_or(false)
+}
+
+pub fn health_for_account(api_url: &str, account: &str) -> bool {
+  health_payload(api_url)
+    .map(|payload| health_payload_matches_account(&payload, account))
+    .unwrap_or(false)
+}
+
+fn health_payload_matches_account(payload: &Value, account: &str) -> bool {
+  if payload.get("ok").and_then(Value::as_bool) != Some(true) {
+    return false;
+  }
+  match payload.get("account").and_then(Value::as_str) {
+    Some(actual) => actual == account,
+    None => account == crate::config::DEFAULT_ACCOUNT,
+  }
 }
 
 pub fn wait_job_result(
@@ -104,7 +120,7 @@ pub fn parse_tcp_url(url: &str) -> Result<(String, u16)> {
   }
   Ok((
     parsed.host_str().unwrap_or("127.0.0.1").to_string(),
-    parsed.port().unwrap_or(18788),
+    parsed.port().unwrap_or(crate::config::PORT_POOL_START + 1),
   ))
 }
 
@@ -118,21 +134,15 @@ pub fn connect_tcp(url: &str, timeout: Duration) -> Result<TcpStream> {
 }
 
 pub fn default_api_url() -> String {
-  crate::config::env_string(
-    &["JUD_API_URL", "GJTD_API_URL", "JUPYTERD_API_URL"],
-    DEFAULT_API_URL,
-  )
+  crate::config::env_string(&["JUD_API_URL"], DEFAULT_API_URL)
 }
 
 pub fn default_stream_url() -> String {
-  crate::config::env_string(
-    &["JUD_STREAM_URL", "GJTD_STREAM_URL", "JUPYTERD_STREAM_URL"],
-    DEFAULT_STREAM_URL,
-  )
+  crate::config::env_string(&["JUD_STREAM_URL"], DEFAULT_STREAM_URL)
 }
 
 pub fn default_log() -> String {
-  crate::config::env_string(&["JUD_LOG", "GJTD_LOG", "JUPYTERD_LOG"], DEFAULT_LOG)
+  crate::config::env_string(&["JUD_LOG"], DEFAULT_LOG)
 }
 
 pub fn daemon_path() -> Result<PathBuf> {
@@ -143,16 +153,25 @@ pub fn daemon_path() -> Result<PathBuf> {
 pub fn start_daemon(
   api_url: &str,
   stream_url: &str,
+  account: &str,
   headless: bool,
   log_path: &str,
   timeout: Duration,
 ) -> Result<()> {
-  if health(api_url) {
-    return Ok(());
+  if let Some(payload) = health_payload(api_url) {
+    if health_payload_matches_account(&payload, account) {
+      return Ok(());
+    }
+    bail!(
+      "jud is already running at {api_url} for another account; use a separate --daemon-url/--stream-url"
+    );
   }
   let parsed = url::Url::parse(api_url)?;
   let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
-  let port = parsed.port().unwrap_or(18787).to_string();
+  let port = parsed
+    .port()
+    .unwrap_or(crate::config::PORT_POOL_START)
+    .to_string();
   let (stream_host, stream_port) = parse_tcp_url(stream_url)?;
   let daemon = daemon_path()?;
   let log_path = expand_tilde(log_path);
@@ -174,6 +193,8 @@ pub fn start_daemon(
     .arg(stream_host)
     .arg("--stream-port")
     .arg(stream_port.to_string())
+    .arg("--account")
+    .arg(account)
     .stdout(Stdio::from(log))
     .stderr(Stdio::from(log_err));
   if headless {
@@ -193,7 +214,7 @@ pub fn start_daemon(
 
   let deadline = Instant::now() + timeout;
   while Instant::now() < deadline {
-    if health(api_url) {
+    if health_for_account(api_url, account) {
       return Ok(());
     }
     thread::sleep(Duration::from_millis(250));
@@ -209,15 +230,22 @@ pub fn ensure_daemon(
   api_url: &str,
   auto_start: bool,
   stream_url: &str,
+  account: &str,
   headless: bool,
   log_path: &str,
   timeout: Duration,
 ) -> Result<()> {
-  if health(api_url) {
-    return Ok(());
+  crate::config::validate_account_name(account)?;
+  if let Some(payload) = health_payload(api_url) {
+    if health_payload_matches_account(&payload, account) {
+      return Ok(());
+    }
+    bail!(
+      "jud is already running at {api_url} for another account; use a separate --daemon-url/--stream-url"
+    );
   }
   if auto_start {
-    start_daemon(api_url, stream_url, headless, log_path, timeout)
+    start_daemon(api_url, stream_url, account, headless, log_path, timeout)
   } else {
     bail!("jud is not running at {api_url}; start it with juctl start")
   }
